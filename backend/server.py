@@ -329,6 +329,31 @@ async def root():
     return {"message": "Raidex API", "version": "1.0.0"}
 
 
+@api_router.get("/health")
+async def health():
+    """Load balancer / uptime probe."""
+    try:
+        await db.command("ping")
+        db_ok = True
+    except Exception:
+        db_ok = False
+    status = "ok" if db_ok else "degraded"
+    return {"status": status, "database": "connected" if db_ok else "unreachable"}
+
+
+@api_router.get("/config")
+async def public_config():
+    """Public client config (no secrets)."""
+    payment_provider = os.getenv("PAYMENT_PROVIDER", "mock").lower()
+    key_id = os.getenv("RAZORPAY_KEY_ID", "")
+    return {
+        "payment_provider": payment_provider,
+        "push_provider": os.getenv("PUSH_PROVIDER", "log").lower(),
+        "kyc_provider": os.getenv("KYC_PROVIDER", "stub").lower(),
+        "razorpay_key_id": key_id if payment_provider == "razorpay" and key_id.startswith("rzp_") else None,
+    }
+
+
 @api_router.post("/auth/register", response_model=TokenResp)
 @limiter.limit("10/minute")
 async def register(request: Request, payload: RegisterRequest):
@@ -552,6 +577,9 @@ class PaymentCreateRequest(BaseModel):
 
 class PaymentConfirmRequest(BaseModel):
     force_outcome: Optional[Literal["success", "failure"]] = None
+    razorpay_payment_id: Optional[str] = None
+    razorpay_order_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
 
 
 async def _append_wallet_ledger(user_id: str, delta: float, reason: str, payment_id: str | None = None, ref_id: str | None = None):
@@ -640,17 +668,22 @@ async def payments_confirm(payment_id: str, payload: PaymentConfirmRequest, user
 
     await db.payments.update_one({"payment_id": payment_id}, {"$set": {"status": "processing", "updated_at": utc_now()}})
     gateway = get_payment_gateway()
+    is_mock = p.get("provider") == "mock"
     # Honour test override on Mock gateway only:
-    if payload.force_outcome == "failure":
+    if is_mock and payload.force_outcome == "failure":
         result_success = False
         from providers.payment_gateway import PaymentResult
         result = PaymentResult(False, None, None, "Test mode: forced failure")
-    elif payload.force_outcome == "success":
+    elif is_mock and payload.force_outcome == "success":
         from providers.payment_gateway import PaymentResult
         result = PaymentResult(True, "pay_mock_" + uuid.uuid4().hex[:10], "sig_mock", None)
         result_success = True
     else:
-        result = await gateway.confirm(order_id=p["provider_order_id"])
+        result = await gateway.confirm(
+            order_id=p["provider_order_id"],
+            provider_payment_id=payload.razorpay_payment_id,
+            provider_signature=payload.razorpay_signature,
+        )
         result_success = result.success
 
     if result_success:

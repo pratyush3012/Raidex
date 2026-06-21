@@ -3,6 +3,7 @@ import { api, saveToken, clearToken, getToken } from "../api/client";
 import * as WebBrowser from "expo-web-browser";
 import * as Linking from "expo-linking";
 import * as Notifications from "expo-notifications";
+import Constants from "expo-constants";
 import { Platform } from "react-native";
 
 type User = {
@@ -45,8 +46,11 @@ async function registerPushToken(): Promise<void> {
     }
     if (finalStatus !== "granted") return;
 
-    const tokenData = await Notifications.getExpoPushTokenAsync();
-    const token = tokenData.data; // ExponentPushToken[xxxxxxxx]
+    const projectId = Constants.expoConfig?.extra?.eas?.projectId;
+    const tokenData = projectId
+      ? await Notifications.getExpoPushTokenAsync({ projectId })
+      : await Notifications.getExpoPushTokenAsync();
+    const token = tokenData.data;
 
     await api("/push/register", {
       method: "POST",
@@ -60,7 +64,10 @@ async function registerPushToken(): Promise<void> {
 async function unregisterPushToken(): Promise<void> {
   if (Platform.OS === "web") return;
   try {
-    const tokenData = await Notifications.getExpoPushTokenAsync();
+    const projectId = Constants.expoConfig?.extra?.eas?.projectId;
+    const tokenData = projectId
+      ? await Notifications.getExpoPushTokenAsync({ projectId })
+      : await Notifications.getExpoPushTokenAsync();
     await api(`/push/register?token=${encodeURIComponent(tokenData.data)}`, {
       method: "DELETE",
     });

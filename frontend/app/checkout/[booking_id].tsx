@@ -101,7 +101,7 @@ export default function Checkout() {
 
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: tokens.spacing.lg, padding: 12, borderRadius: 12, backgroundColor: c.accentBg }}>
           <Ionicons name="shield-checkmark" size={16} color={c.onAccentBg} />
-          <Text style={{ color: c.onAccentBg, fontSize: 12, flex: 1 }}>Secure mock checkout. Razorpay can be enabled by setting PAYMENT_PROVIDER=razorpay.</Text>
+          <Text style={{ color: c.onAccentBg, fontSize: 12, flex: 1 }}>Payments secured via Razorpay. Test mode uses mock gateway when PAYMENT_PROVIDER=mock.</Text>
         </View>
       </ScrollView>
 
