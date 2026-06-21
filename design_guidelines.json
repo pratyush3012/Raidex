@@ -1,0 +1,284 @@
+{
+  "app_name": "RIDEX",
+  "personality": "1 iOS-Native Clean",
+  "personality_one_liner": "Uber-level stark simplicity and Tesla-level cleanliness, defined by stark contrasts, generous breathing room, and a relentless focus on the vehicle and map.",
+  "color": {
+    "surface_light": "#FFFFFF",
+    "onSurface_light": "#111111",
+    "surfaceSecondary_light": "#F4F4F5",
+    "onSurfaceSecondary_light": "#3F3F46",
+    "surfaceTertiary_light": "#E4E4E7",
+    "onSurfaceTertiary_light": "#52525B",
+    "surfaceInverse_light": "#111111",
+    "onSurfaceInverse_light": "#FFFFFF",
+    "brand_light": "#05C46B",
+    "brandPrimary_light": "#111111",
+    "onBrandPrimary_light": "#FFFFFF",
+    "brandSecondary_light": "#F4F4F5",
+    "onBrandSecondary_light": "#111111",
+    "brandTertiary_light": "#E8F8F0",
+    "onBrandTertiary_light": "#037A42",
+    "success_light": "#05C46B",
+    "onSuccess_light": "#FFFFFF",
+    "warning_light": "#F59E0B",
+    "onWarning_light": "#FFFFFF",
+    "error_light": "#EF4444",
+    "onError_light": "#FFFFFF",
+    "info_light": "#52525B",
+    "onInfo_light": "#FFFFFF",
+    "border_light": "#E4E4E7",
+    "borderStrong_light": "#A1A1AA",
+    "divider_light": "#F4F4F5",
+
+    "surface_dark": "#000000",
+    "onSurface_dark": "#FFFFFF",
+    "surfaceSecondary_dark": "#18181B",
+    "onSurfaceSecondary_dark": "#A1A1AA",
+    "surfaceTertiary_dark": "#27272A",
+    "onSurfaceTertiary_dark": "#D4D4D8",
+    "surfaceInverse_dark": "#FFFFFF",
+    "onSurfaceInverse_dark": "#111111",
+    "brand_dark": "#05C46B",
+    "brandPrimary_dark": "#FFFFFF",
+    "onBrandPrimary_dark": "#000000",
+    "brandSecondary_dark": "#18181B",
+    "onBrandSecondary_dark": "#FFFFFF",
+    "brandTertiary_dark": "#03331C",
+    "onBrandTertiary_dark": "#34D399",
+    "success_dark": "#05C46B",
+    "onSuccess_dark": "#000000",
+    "warning_dark": "#FBBF24",
+    "onWarning_dark": "#000000",
+    "error_dark": "#F87171",
+    "onError_dark": "#000000",
+    "info_dark": "#A1A1AA",
+    "onInfo_dark": "#000000",
+    "border_dark": "#27272A",
+    "borderStrong_dark": "#52525B",
+    "divider_dark": "#18181B"
+  },
+  "typography": {
+    "displayFontFamily": "Plus Jakarta Sans",
+    "textFontFamily": "Plus Jakarta Sans",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Generous margin (lg/xl) around containers. Sticky primary buttons must float over scrollable content with clear safe-area bottom padding. No cramped half-width cards.",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 6,
+    "md": 12,
+    "lg": 20,
+    "pill": 999
+  },
+  "shadow_tier": 1,
+  "navigation": "bottom_tabs",
+  "icon_set": "Phosphor",
+  "glassmorphism": {
+    "enabled": true,
+    "do's": [
+      "Use over the persistent map interface (bottom sheets, floating search bars).",
+      "Sticky headers above scrollable vehicle listings.",
+      "Featured vehicle cards layered over hero photography."
+    ],
+    "dont's": [
+      "Don't blur dense forms, profile settings rows, or standard buttons.",
+      "Don't stack more than 2 glass surfaces (e.g., header + tab bar is enough)."
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "expo-glass-effect",
+      "android": "expo-blur",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "haptics": {
+    "events": {
+      "primary_button_press": "impactLight",
+      "tab_change": "selection",
+      "vehicle_swipe": "impactLight",
+      "booking_confirm": "notificationSuccess",
+      "bottom_sheet_snap": "impactLight"
+    }
+  },
+  "screens": [
+    {
+      "name": "Splash & Onboarding",
+      "purpose": "Communicate brand value ('Drive More. Own Less.') with cinematic full-bleed visuals.",
+      "states": {
+        "loading": "Brand logo centered fade",
+        "empty": "N/A",
+        "error": "N/A"
+      },
+      "layout": "Full-bleed imagery with a vertical gradient scrim (transparent to surfaceInverse at bottom). Large typography, floating 'Get Started' CTA sticky at bottom."
+    },
+    {
+      "name": "Auth (Login/Signup)",
+      "purpose": "Minimalist entry point via Email/Password or Google.",
+      "states": {
+        "loading": "CTA button spinner",
+        "empty": "N/A",
+        "error": "Inline red validation text under inputs"
+      },
+      "layout": "Single column. Large title, vertically stacked inputs with labels above. Sticky primary CTA. Secondary 'Continue with Google' button with logo. Generous vertical rhythm."
+    },
+    {
+      "name": "Home / Discovery",
+      "purpose": "Dual-mode map & list view to find nearby vehicles.",
+      "states": {
+        "loading": "Skeleton map markers and skeleton list cards",
+        "empty": "Illustration of empty road: 'No vehicles nearby, zoom out map.'",
+        "error": "Toast + Retry overlay on map"
+      },
+      "layout": "Full-bleed Map as the background. Floating glass search bar at top safe area. '@gorhom/bottom-sheet' containing category chips (All, Cars, Bikes, Subs) and the vehicle list. Swipe up to expand list. List items use edge-to-edge images."
+    },
+    {
+      "name": "Search & Filters",
+      "purpose": "Refine vehicle choices smoothly.",
+      "states": {
+        "loading": "N/A",
+        "empty": "N/A",
+        "error": "N/A"
+      },
+      "layout": "Modal over Home. Chip rows for Category, Price Slider, Transmission, Seats. Sticky 'Apply Filters' CTA at bottom."
+    },
+    {
+      "name": "Vehicle Details",
+      "purpose": "Airbnb-style immersive listing to drive conversions.",
+      "states": {
+        "loading": "Hero image skeleton",
+        "empty": "N/A",
+        "error": "Failed to load vehicle details + Retry button"
+      },
+      "layout": "Large hero image (edge-to-edge) at top. Vehicle Name & Price below. Horizontal scroll for Specs (Seats, Fuel, Auto). Trust section with Host avatar (round) and Rating. Sticky 'Book Now' CTA inside a glass container at the absolute bottom over scrolling content."
+    },
+    {
+      "name": "Booking Flow",
+      "purpose": "Low-friction step sequence (Dates -> Summary -> Pay).",
+      "states": {
+        "loading": "Spinner over payment confirmation",
+        "empty": "N/A",
+        "error": "Payment failed toast"
+      },
+      "layout": "Clean stack layout. Date picker module (calendar), Add-ons toggles, Cost breakdown (subtotal, taxes, RideMiles discount). Sticky 'Confirm & Pay' at bottom."
+    },
+    {
+      "name": "Active Trip",
+      "purpose": "Real-time dashboard for the ongoing rental.",
+      "states": {
+        "loading": "Fetching vehicle state...",
+        "empty": "N/A",
+        "error": "GPS connection lost warning banner"
+      },
+      "layout": "Dark-First Utility inspired layout nested here: Giant countdown timer / mileage tracker. Prominent 'End Trip' and 'SOS' action buttons. Inspection photos grid. Minimalist, focused on live operational data."
+    },
+    {
+      "name": "RideMiles Rewards",
+      "purpose": "Showcase user loyalty tier and points.",
+      "states": {
+        "loading": "Skeleton tier card",
+        "empty": "You haven't earned any RideMiles yet.",
+        "error": "N/A"
+      },
+      "layout": "Hero tier card (glassmorphism over a brandTertiary gradient). Circular progress ring for points. List of available coupons below."
+    },
+    {
+      "name": "Wallet & Coupons",
+      "purpose": "Manage balances and payment methods.",
+      "states": {
+        "loading": "Skeleton list",
+        "empty": "No saved cards.",
+        "error": "N/A"
+      },
+      "layout": "Large balance display at top. List of Payment Methods. 'Add Card' floating action button."
+    },
+    {
+      "name": "Profile + KYC",
+      "purpose": "Account settings and identity verification.",
+      "states": {
+        "loading": "Uploading documents...",
+        "empty": "N/A",
+        "error": "KYC rejected - please retake photo"
+      },
+      "layout": "Avatar at top. Clean list rows (trailing chevron) for settings. KYC uses a stepper layout (License -> Aadhaar -> Face selfie) with full-screen camera overlays."
+    },
+    {
+      "name": "Notifications",
+      "purpose": "Inbox for system, trip, and promotional alerts.",
+      "states": {
+        "loading": "Skeleton rows",
+        "empty": "All caught up! No new notifications.",
+        "error": "N/A"
+      },
+      "layout": "Simple vertical list. Unread items have a brandTertiary background tint."
+    },
+    {
+      "name": "Vehicle Owner Mini-Dashboard",
+      "purpose": "Earnings and listings overview for hosts.",
+      "states": {
+        "loading": "Skeleton metrics",
+        "empty": "List your first vehicle to start earning.",
+        "error": "N/A"
+      },
+      "layout": "Segmented control at top (Earnings | Listings). 2-column grid for stat cards (Total Earned, Active Trips). List of owned vehicles below."
+    }
+  ],
+  "images": {
+    "onboarding_hero_1": {
+      "url": "https://images.unsplash.com/photo-1777329385816-4220415c266d?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1ODB8MHwxfHNlYXJjaHwxfHxUZXNsYSUyMGNhciUyMG1vZGVybiUyMGNpdHl8ZW58MHx8fHwxNzgxOTcxNjAxfDA&ixlib=rb-4.1.0&q=85",
+      "dark": "https://images.pexels.com/photos/24589301/pexels-photo-24589301.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "alt": "White electric car driving on dark city street"
+    },
+    "onboarding_hero_2": {
+      "url": "https://images.pexels.com/photos/16510639/pexels-photo-16510639.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "dark": "https://images.unsplash.com/photo-1700884520248-92092bd21e63?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjY2NjV8MHwxfHNlYXJjaHwxfHxsdXh1cnklMjBTVVYlMjBkcml2aW5nfGVufDB8fHx8MTc4MTk3MTYwMnww&ixlib=rb-4.1.0&q=85",
+      "alt": "Luxury SUV driving"
+    },
+    "car_listing_suv": {
+      "url": "https://images.unsplash.com/photo-1758217209786-95458c5d30a7?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjY2NjV8MHwxfHNlYXJjaHwzfHxsdXh1cnklMjBTVVYlMjBkcml2aW5nfGVufDB8fHx8MTc4MTk3MTYwMnww&ixlib=rb-4.1.0&q=85",
+      "alt": "White Cadillac Escalade SUV driving on highway"
+    },
+    "bike_listing": {
+      "url": "https://images.pexels.com/photos/15836900/pexels-photo-15836900.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "alt": "Row of parked motorbikes"
+    },
+    "avatar_host": {
+      "url": "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2ODh8MHwxfHNlYXJjaHwyfHxwcm9mZXNzaW9uYWwlMjBoZWFkc2hvdCUyMHBvcnRyYWl0fGVufDB8fHx8MTc4MTk3MTYwMXww&ixlib=rb-4.1.0&q=85",
+      "alt": "Professional host headshot"
+    },
+    "avatar_user": {
+      "url": "https://images.pexels.com/photos/26872232/pexels-photo-26872232.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "alt": "Professional user headshot"
+    }
+  },
+  "instructions_to_main_agent": [
+    "Apply the monochrome high-contrast iOS-Native Clean personality. Black is the primary color in light mode, white in dark mode. Emerald Green (#05C46B) is reserved for success states, tags, and very specific brand highlights to emulate Tesla/Uber premium vibes.",
+    "Never use blue, indigo, purple, or navy anywhere in the UI. Follow the strict color ban.",
+    "Map UI (Home/Discovery): Use a persistent full-bleed map behind a @gorhom/bottom-sheet. Ensure the bottom sheet has a glassmorphism header and swipeable interactions.",
+    "Vehicle Details MUST follow the Airbnb layout: massive hero image, horizontal scrolling specs, prominent host trust signals, and a sticky booking CTA anchored securely at the bottom.",
+    "Use gradient scrims (transparent to surfaceInverse) strictly on images with text overlays (like onboarding). Text over raw images without a scrim is a zero-tolerance violation.",
+    "Implement haptics meticulously using the defined haptics mapping. Feedback on tabs, button presses, and bottom sheet snaps is critical.",
+    "Ensure safe area boundaries are strictly respected—content should never sit under notches or the home indicator.",
+    "Payments are mocked for the MVP build. Document this clearly in the UI (e.g., 'Test Mode' badge).",
+    "Use Phosphor icons consistently with 'regular' weight (no mixing filled/outlined except in tab bars)."
+  ]
+}
