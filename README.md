@@ -93,6 +93,36 @@ npm start -- --clear
 
 ---
 
+## 🔄 Keep Backend Always Awake (Important!)
+
+Render free tier sleeps after 15 min inactivity. Choose one method to keep it awake 24/7:
+
+### Method 1: UptimeRobot (Recommended - Easiest)
+1. Sign up: https://uptimerobot.com/ (free)
+2. Add New Monitor
+3. Type: `HTTP(s)`
+4. URL: `https://your-app.onrender.com/api/health`
+5. Interval: `5 minutes`
+6. Done! Backend stays awake 24/7 ✅
+
+### Method 2: GitHub Actions (Automatic)
+Already configured! GitHub will ping your backend every 10 minutes automatically.
+
+**To activate:**
+1. After deployment, edit `.github/workflows/keep-alive.yml`
+2. Replace `https://raidex-backend.onrender.com` with your actual Render URL
+3. Commit and push
+4. GitHub Actions will start automatically ✅
+
+### Method 3: Cron-job.org
+1. Sign up: https://cron-job.org/ (free)
+2. Create cronjob
+3. URL: `https://your-app.onrender.com/api/health`
+4. Schedule: Every 10 minutes
+5. Done! ✅
+
+---
+
 ## 📱 Testing
 
 ### Test Cards (Razorpay)
