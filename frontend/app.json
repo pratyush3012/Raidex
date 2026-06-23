@@ -21,6 +21,10 @@
     "android": {
       "package": "in.raidex.app",
       "versionCode": 1,
+      "androidStatusBar": {
+        "backgroundColor": "#000000",
+        "barStyle": "light-content"
+      },
       "permissions": [
         "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.ACCESS_FINE_LOCATION",
@@ -34,7 +38,7 @@
       ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
-        "backgroundColor": "#000"
+        "backgroundColor": "#000000"
       },
       "edgeToEdgeEnabled": true
     },
@@ -88,6 +92,11 @@
       "eas": {
         "projectId": "a0b463b3-c2b7-4b72-87f1-6b3f16287aeb"
       }
+    },
+    "install": {
+      "exclude": [
+        "expo-constants"
+      ]
     },
     "owner": "wancry30"
   }
