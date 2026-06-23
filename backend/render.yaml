@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: raidex-backend
+    env: python
+    region: singapore
+    plan: free
+    runtime: python
+    pythonVersion: "3.12.0"
+    buildCommand: pip install -r requirements-deploy.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MONGO_URL
+        sync: false          # you paste this from Atlas after setup
+      - key: DB_NAME
+        value: raidex
+      - key: PAYMENT_PROVIDER
+        value: mock
+      - key: PUSH_PROVIDER
+        value: log
+      - key: KYC_PROVIDER
+        value: stub
+      - key: DAMAGE_AI_PROVIDER
+        value: stub
+      - key: ALLOWED_ORIGINS
+        value: "*"
