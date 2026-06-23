@@ -335,6 +335,7 @@ async def root():
 
 
 @api_router.get("/health")
+@api_router.head("/health")
 async def health():
     """Load balancer / uptime probe."""
     try:
