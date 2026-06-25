@@ -1,0 +1,75 @@
+name: Raidex Release Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: Release name
+        required: true
+        type: string
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Frontend install
+        working-directory: frontend
+        run: npm ci
+
+      - name: Frontend typecheck
+        working-directory: frontend
+        run: npm run typecheck
+
+      - name: Frontend lint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Frontend tests
+        working-directory: frontend
+        run: npm test -- --watch=false
+
+      - name: Frontend dependency audit
+        working-directory: frontend
+        run: npm audit --omit=dev --audit-level=high
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Backend install
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip install -r backend/requirements.txt
+
+      - name: Backend tests
+        run: python -m pytest backend/tests -q
+
+      - name: Backend security audit
+        run: pip-audit -r backend/requirements.txt
+
+      - name: Generate changelog
+        run: |
+          git log --oneline -20 > CHANGELOG_RELEASE.txt
+
+      - name: Create release artifact
+        run: |
+          mkdir -p release-artifacts
+          cp CHANGELOG_RELEASE.txt release-artifacts/
+          cp PHASE_5_PLATFORM_REPORT.md release-artifacts/ || true
+          cp PLAY_STORE_READINESS.md release-artifacts/ || true
+          tar -czf raidex-release-${{ github.event.inputs.release_name }}.tgz release-artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raidex-release-${{ github.event.inputs.release_name }}
+          path: raidex-release-${{ github.event.inputs.release_name }}.tgz

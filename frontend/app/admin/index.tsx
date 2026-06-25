@@ -9,7 +9,7 @@ import { useTheme, tokens } from "@/src/theme";
 import { api } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 
-type Tab = "kpis" | "vehicles" | "users" | "payments" | "geofence" | "nexus";
+type Tab = "kpis" | "vehicles" | "kyc" | "users" | "payments" | "disputes" | "geofence" | "health" | "nexus";
 
 export default function AdminConsole() {
   const c = useTheme();
@@ -21,7 +21,10 @@ export default function AdminConsole() {
   const [vehicles, setVehicles] = useState<any[]>([]);
   const [users, setUsers] = useState<any[]>([]);
   const [payments, setPayments] = useState<any[]>([]);
+  const [kyc, setKyc] = useState<any[]>([]);
+  const [disputes, setDisputes] = useState<any[]>([]);
   const [geo, setGeo] = useState<any[]>([]);
+  const [health, setHealth] = useState<any>(null);
   const [loading, setLoading] = useState(false);
 
   const loadTab = useCallback(async (t: Tab) => {
@@ -29,9 +32,12 @@ export default function AdminConsole() {
     try {
       if (t === "kpis") setKpis(await api<any>("/admin/kpis"));
       if (t === "vehicles") setVehicles(await api<any[]>("/admin/vehicles?verification_status=pending"));
+      if (t === "kyc") setKyc(await api<any[]>("/admin/kyc"));
       if (t === "users") setUsers(await api<any[]>("/admin/users"));
       if (t === "payments") setPayments(await api<any[]>("/admin/payments"));
+      if (t === "disputes") setDisputes(await api<any[]>("/admin/disputes"));
       if (t === "geofence") setGeo(await api<any[]>("/admin/geofence-events"));
+      if (t === "health") setHealth(await api<any>("/admin/system-health"));
     } catch (e: any) { Alert.alert("Error", e.message); } finally { setLoading(false); }
   }, []);
 
@@ -53,9 +59,12 @@ export default function AdminConsole() {
   const tabs: { k: Tab; label: string; ic: any }[] = [
     { k: "kpis", label: "Overview", ic: "stats-chart" },
     { k: "vehicles", label: "Approvals", ic: "checkmark-done" },
+    { k: "kyc", label: "KYC", ic: "id-card" },
     { k: "users", label: "Users", ic: "people" },
     { k: "payments", label: "Payments", ic: "card" },
+    { k: "disputes", label: "Disputes", ic: "flag" },
     { k: "geofence", label: "Geofence", ic: "shield" },
+    { k: "health", label: "Health", ic: "pulse" },
     { k: "nexus", label: "AI Nexus", ic: "sparkles" },
   ];
 
@@ -157,6 +166,24 @@ export default function AdminConsole() {
           </View>
         )}
 
+        {tab === "kyc" && (
+          <View>
+            <Text style={{ color: c.onSurface, fontWeight: "800", fontSize: 14, marginBottom: 12 }}>KYC submissions ({kyc.length})</Text>
+            {kyc.length === 0 ? <EmptyState c={c} icon="id-card-outline" text="No KYC submissions yet" /> :
+              kyc.map((item) => (
+                <View key={item.kyc_id} style={[styles.row, { backgroundColor: c.surface2, borderColor: c.border, marginBottom: 8 }]}>
+                  <Ionicons name={item.status === "verified" ? "checkmark-circle" : item.status === "rejected" ? "close-circle" : "time"} size={22} color={item.status === "verified" ? c.accent : item.status === "rejected" ? c.error : c.warning} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: c.onSurface, fontWeight: "700" }}>{item.dl_number || item.user_id}</Text>
+                    <Text style={{ color: c.onSurface3, fontSize: 11 }}>Aadhaar: ****{item.aadhaar_last4} · {item.provider || "provider"}</Text>
+                  </View>
+                  <Text style={{ color: c.onSurface, fontSize: 10, fontWeight: "800", textTransform: "uppercase" }}>{item.status}</Text>
+                </View>
+              ))
+            }
+          </View>
+        )}
+
         {tab === "payments" && (
           <View>
             <Text style={{ color: c.onSurface, fontWeight: "800", fontSize: 14, marginBottom: 12 }}>Recent payments ({payments.length})</Text>
@@ -172,6 +199,24 @@ export default function AdminConsole() {
                 <Text style={{ color: c.onSurface, fontSize: 10, fontWeight: "800", textTransform: "uppercase" }}>{p.status}</Text>
               </View>
             ))}
+          </View>
+        )}
+
+        {tab === "disputes" && (
+          <View>
+            <Text style={{ color: c.onSurface, fontWeight: "800", fontSize: 14, marginBottom: 12 }}>Disputes ({disputes.length})</Text>
+            {disputes.length === 0 ? <EmptyState c={c} icon="flag-outline" text="No disputes" /> :
+              disputes.map((d) => (
+                <View key={d.dispute_id} style={[styles.row, { backgroundColor: c.surface2, borderColor: c.border, marginBottom: 8 }]}>
+                  <Ionicons name="flag" size={20} color={d.status === "resolved" ? c.accent : c.warning} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: c.onSurface, fontWeight: "700", textTransform: "capitalize" }}>{d.category}</Text>
+                    <Text style={{ color: c.onSurface3, fontSize: 11 }} numberOfLines={2}>{d.message}</Text>
+                  </View>
+                  <Text style={{ color: c.onSurface, fontSize: 10, fontWeight: "800", textTransform: "uppercase" }}>{d.status}</Text>
+                </View>
+              ))
+            }
           </View>
         )}
 
@@ -191,6 +236,28 @@ export default function AdminConsole() {
                   </View>
                 </View>
               ))}
+          </View>
+        )}
+
+        {tab === "health" && health && (
+          <View>
+            <Text style={{ color: c.onSurface, fontWeight: "800", fontSize: 14, marginBottom: 12 }}>System health</Text>
+            {[
+              ["Database", health.database],
+              ["Payments", health.payment_provider],
+              ["KYC", health.kyc_provider],
+              ["Push", health.push_provider],
+              ["LLM", health.llm_configured ? "configured" : "missing"],
+              ["Open disputes", String(health.open_disputes)],
+              ["Failed payments", String(health.failed_payments_24h)],
+              ["Pending KYC", String(health.pending_kyc)],
+            ].map(([label, value]) => (
+              <View key={label} style={[styles.row, { backgroundColor: c.surface2, borderColor: c.border, marginBottom: 8 }]}>
+                <Ionicons name={value === "connected" || value === "configured" ? "checkmark-circle" : "information-circle"} size={20} color={value === "connected" || value === "configured" ? c.accent : c.onSurface3} />
+                <Text style={{ color: c.onSurface, fontWeight: "700", flex: 1 }}>{label}</Text>
+                <Text style={{ color: c.onSurface2, fontWeight: "800" }}>{value}</Text>
+              </View>
+            ))}
           </View>
         )}
 

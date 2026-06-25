@@ -18,6 +18,8 @@ node_modules/
 
 # Testing
 /coverage
+.coverage
+**/coverage/
 
 # Next.js
 /.next/
@@ -77,6 +79,12 @@ backend/raidex.db
 
 # Build caches
 .cache/
+.expo/
+frontend/.expo/
+.npm-cache/
+frontend/.npm-cache/
+.codex-export-check/
+frontend/.codex-export-check/
 
 memory/test_credentials.md
 

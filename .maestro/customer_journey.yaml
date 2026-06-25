@@ -1,0 +1,22 @@
+appId: in.raidex.app
+---
+- launchApp
+- assertVisible: "RAIDEX"
+- tapOn:
+    id: "get-started-btn"
+- tapOn:
+    id: "name-input"
+- inputText: "QA Rider"
+- tapOn:
+    id: "email-input"
+- inputText: "qa+rider@example.com"
+- tapOn:
+    id: "password-input"
+- inputText: "Test1234!"
+- tapOn:
+    id: "auth-submit-btn"
+- assertVisible: "Nearby vehicles"
+- tapOn:
+    id: "search-input"
+- inputText: "Bike under Rs 1000 near me"
+- assertVisible: "Compare"

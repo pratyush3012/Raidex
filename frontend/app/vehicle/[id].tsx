@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, Dimensions } from "react-native";
+import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, Dimensions, Alert } from "react-native";
 import { Image } from "expo-image";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
@@ -18,16 +18,56 @@ export default function VehicleDetail() {
   const insets = useSafeAreaInsets();
   const [v, setV] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [wished, setWished] = useState(false);
+  const [reviews, setReviews] = useState<any[]>([]);
   const { user } = useAuth();
 
-  useEffect(() => {
-    (async () => {
-      try { setV(await api(`/vehicles/${id}`)); } catch {} finally { setLoading(false); }
-    })();
-  }, [id]);
+  const load = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const vehicle = await api<any>(`/vehicles/${id}`);
+      setV(vehicle);
+      const [wishlist, reviewItems] = await Promise.all([
+        api<any[]>("/wishlist").catch(() => []),
+        api<any[]>(`/vehicles/${id}/reviews`).catch(() => []),
+      ]);
+      setWished(wishlist.some((it) => it.vehicle_id === id));
+      setReviews(reviewItems);
+    } catch (e: any) {
+      setError(e.message || "Could not load vehicle");
+      setV(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, [id]);
+
+  const toggleWishlist = async () => {
+    if (!v) return;
+    const next = !wished;
+    setWished(next);
+    try {
+      await api(`/wishlist/${v.vehicle_id}`, { method: next ? "POST" : "DELETE" });
+    } catch (e: any) {
+      setWished(!next);
+      Alert.alert("Wishlist", e.message || "Could not update wishlist.");
+    }
+  };
 
   if (loading) return <View style={{ flex: 1, backgroundColor: c.surface, alignItems: "center", justifyContent: "center" }}><ActivityIndicator color={c.accent} size="large" /></View>;
-  if (!v) return <View style={{ flex: 1, backgroundColor: c.surface, alignItems: "center", justifyContent: "center" }}><Text style={{ color: c.onSurface }}>Vehicle not found</Text></View>;
+  if (!v) return (
+    <View style={{ flex: 1, backgroundColor: c.surface, alignItems: "center", justifyContent: "center", padding: 28 }}>
+      <Ionicons name={error ? "cloud-offline-outline" : "car-outline"} size={54} color={c.onSurface3} />
+      <Text style={{ color: c.onSurface, fontSize: 18, fontWeight: "800", marginTop: 14 }}>{error ? "Could not load vehicle" : "Vehicle not found"}</Text>
+      <Text style={{ color: c.onSurface3, textAlign: "center", marginTop: 6 }}>{error || "This listing may no longer be available."}</Text>
+      <Pressable onPress={load} style={[styles.retryBtn, { backgroundColor: c.inverse }]}>
+        <Text style={{ color: c.onInverse, fontWeight: "800" }}>Retry</Text>
+      </Pressable>
+    </View>
+  );
 
   return (
     <View style={{ flex: 1, backgroundColor: c.surface }}>
@@ -39,8 +79,12 @@ export default function VehicleDetail() {
             <View style={{ flexDirection: "row", justifyContent: "space-between", padding: tokens.spacing.lg }}>
               <Pressable testID="back-btn" onPress={() => router.back()} style={styles.iconBtn}><Ionicons name="chevron-back" size={22} color="#fff" /></Pressable>
               <View style={{ flexDirection: "row", gap: 10 }}>
-                <Pressable style={styles.iconBtn}><Ionicons name="heart-outline" size={20} color="#fff" /></Pressable>
-                <Pressable style={styles.iconBtn}><Ionicons name="share-outline" size={20} color="#fff" /></Pressable>
+                <Pressable testID="wishlist-btn" onPress={toggleWishlist} style={styles.iconBtn}>
+                  <Ionicons name={wished ? "heart" : "heart-outline"} size={20} color={wished ? "#EF4444" : "#fff"} />
+                </Pressable>
+                <Pressable testID="share-btn" onPress={() => Alert.alert("Share", `${v.name} is available on Raidex in ${v.location}.`)} style={styles.iconBtn}>
+                  <Ionicons name="share-outline" size={20} color="#fff" />
+                </Pressable>
               </View>
             </View>
           </SafeAreaView>
@@ -94,8 +138,25 @@ export default function VehicleDetail() {
               <Text style={{ color: c.onSurface, fontWeight: "700", fontSize: 15 }}>{v.host_name}</Text>
               <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 2 }}>{v.trips} trips · Verified host</Text>
             </View>
-            <Pressable style={[styles.chatBtn, { backgroundColor: c.surface3 }]}><Ionicons name="chatbubble-outline" size={18} color={c.onSurface} /></Pressable>
+            <Pressable testID="host-chat-btn" onPress={() => router.push("/support" as any)} style={[styles.chatBtn, { backgroundColor: c.surface3 }]}><Ionicons name="chatbubble-outline" size={18} color={c.onSurface} /></Pressable>
           </View>
+
+          <Text style={[styles.h2, { color: c.onSurface }]}>Reviews</Text>
+          {reviews.length === 0 ? (
+            <View style={[styles.depositRow, { backgroundColor: c.surface2, borderColor: c.border }]}>
+              <Ionicons name="star-outline" size={20} color={c.onSurface3} />
+              <Text style={{ color: c.onSurface3, flex: 1 }}>No reviews yet. Complete a trip to leave the first review.</Text>
+            </View>
+          ) : reviews.slice(0, 3).map((r) => (
+            <View key={r.review_id} style={[styles.reviewCard, { backgroundColor: c.surface2, borderColor: c.border }]}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                <Ionicons name="star" size={14} color="#F59E0B" />
+                <Text style={{ color: c.onSurface, fontWeight: "800" }}>{r.rating}/5</Text>
+                <Text style={{ color: c.onSurface3, fontSize: 12 }}>by {r.user_name}</Text>
+              </View>
+              {!!r.comment && <Text style={{ color: c.onSurface2, marginTop: 6, lineHeight: 20 }}>{r.comment}</Text>}
+            </View>
+          ))}
 
           <Text style={[styles.h2, { color: c.onSurface }]}>Security deposit</Text>
           <View style={[styles.depositRow, { backgroundColor: c.surface2, borderColor: c.border }]}>
@@ -148,6 +209,8 @@ const styles = StyleSheet.create({
   hostCard: { flexDirection: "row", alignItems: "center", gap: 12, padding: 14, borderRadius: 16, borderWidth: 1 },
   chatBtn: { width: 40, height: 40, borderRadius: 999, alignItems: "center", justifyContent: "center" },
   depositRow: { flexDirection: "row", alignItems: "center", gap: 12, padding: 14, borderRadius: 16, borderWidth: 1 },
+  reviewCard: { padding: 14, borderRadius: 16, borderWidth: 1, marginBottom: 8 },
   footer: { position: "absolute", left: 0, right: 0, bottom: 0, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 20, paddingTop: 14, borderTopWidth: 1 },
   bookBtn: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 22, paddingVertical: 14, borderRadius: 14 },
+  retryBtn: { paddingHorizontal: 20, paddingVertical: 12, borderRadius: 12, marginTop: 18 },
 });

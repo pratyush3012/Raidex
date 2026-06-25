@@ -24,6 +24,7 @@ export default function PayScreen() {
   const mockStarted = useRef(false);
 
   const providerLabel = payment?.provider === "razorpay" ? "Razorpay" : "Mock Gateway";
+  const isWalletTopup = payment?.purpose === "wallet_topup";
 
   const confirmPayment = useCallback(
     async (body: Record<string, string> = {}) => {
@@ -168,7 +169,9 @@ export default function PayScreen() {
               <Ionicons name="checkmark" size={56} color="#fff" />
             </View>
             <Text style={{ color: c.onSurface, fontSize: 28, fontWeight: "800", marginTop: 28 }}>Payment successful</Text>
-            <Text style={{ color: c.onSurface3, marginTop: 8, textAlign: "center" }}>Your booking is confirmed.</Text>
+            <Text style={{ color: c.onSurface3, marginTop: 8, textAlign: "center" }}>
+              {isWalletTopup ? "Your wallet has been topped up." : "Your booking is confirmed."}
+            </Text>
             <View style={[styles.receipt, { backgroundColor: c.surface2, borderColor: c.border }]}>
               <ReceiptRow label="Amount paid" val={`₹${payment?.amount?.toLocaleString()}`} c={c} bold />
               <ReceiptRow label="Payment ID" val={payment?.payment_id?.slice(0, 18) + "…"} c={c} />
@@ -176,8 +179,8 @@ export default function PayScreen() {
               <ReceiptRow label="Status" val="Succeeded" c={c} accent />
             </View>
           </View>
-          <Pressable testID="view-trip-btn" onPress={() => router.replace("/(tabs)/trips" as any)} style={[styles.cta, { backgroundColor: c.inverse }]}>
-            <Text style={{ color: c.onInverse, fontWeight: "800", fontSize: 16 }}>View my trip</Text>
+          <Pressable testID="view-trip-btn" onPress={() => router.replace(isWalletTopup ? "/(tabs)/profile" : "/(tabs)/trips" as any)} style={[styles.cta, { backgroundColor: c.inverse }]}>
+            <Text style={{ color: c.onInverse, fontWeight: "800", fontSize: 16 }}>{isWalletTopup ? "Back to profile" : "View my trip"}</Text>
             <Ionicons name="arrow-forward" size={18} color={c.onInverse} />
           </Pressable>
         </SafeAreaView>
@@ -199,7 +202,11 @@ export default function PayScreen() {
             <ReceiptRow label="Status" val="Failed" c={c} danger />
           </View>
         </View>
-        <Pressable testID="retry-btn" onPress={() => router.replace(`/checkout/${payment?.booking_id}` as any)} style={[styles.cta, { backgroundColor: c.inverse }]}>
+        <Pressable
+          testID="retry-btn"
+          onPress={() => router.replace(payment?.booking_id ? `/checkout/${payment.booking_id}` : "/(tabs)/profile" as any)}
+          style={[styles.cta, { backgroundColor: c.inverse }]}
+        >
           <Text style={{ color: c.onInverse, fontWeight: "800", fontSize: 16 }}>Try again</Text>
         </Pressable>
         <Pressable testID="cancel-btn" onPress={() => router.replace("/(tabs)" as any)} style={[styles.cta, { backgroundColor: c.surface2, marginTop: 8 }]}>

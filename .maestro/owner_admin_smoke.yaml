@@ -1,0 +1,19 @@
+appId: in.raidex.app
+---
+- launchApp
+- assertVisible: "RAIDEX"
+- tapOn:
+    id: "have-account-btn"
+- tapOn:
+    id: "email-input"
+- inputText: "owner@example.com"
+- tapOn:
+    id: "password-input"
+- inputText: "Test1234!"
+- tapOn:
+    id: "auth-submit-btn"
+- assertVisible: "Nearby vehicles"
+- tapOn: "Profile"
+- tapOn:
+    id: "owner-row"
+- assertVisible: "Host Dashboard"

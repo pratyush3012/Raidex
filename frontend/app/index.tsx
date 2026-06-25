@@ -31,10 +31,23 @@ export default function Landing() {
 
   const submit = async () => {
     setError(null);
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail.includes("@")) {
+      setError("Enter a valid email address");
+      return;
+    }
+    if (password.length < 6) {
+      setError("Password must be at least 6 characters");
+      return;
+    }
+    if (mode === "signup" && name.trim().length < 2) {
+      setError("Enter your name");
+      return;
+    }
     setBusy(true);
     try {
-      if (mode === "login") await login(email.trim(), password);
-      else await register(email.trim(), password, name.trim() || email.split("@")[0]);
+      if (mode === "login") await login(cleanEmail, password);
+      else await register(cleanEmail, password, name.trim());
     } catch (e: any) {
       setError(e.message || "Something went wrong");
     } finally {

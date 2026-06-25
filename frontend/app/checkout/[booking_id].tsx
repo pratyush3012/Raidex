@@ -17,12 +17,19 @@ export default function Checkout() {
   const [b, setB] = useState<any>(null);
   const [method, setMethod] = useState<Method>("card");
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    (async () => {
-      try { setB(await api(`/bookings/${booking_id}`)); } catch {}
-    })();
-  }, [booking_id]);
+  const load = async () => {
+    setError(null);
+    try {
+      setB(await api(`/bookings/${booking_id}`));
+    } catch (e: any) {
+      setError(e.message || "Could not load checkout");
+      setB(null);
+    }
+  };
+
+  useEffect(() => { load(); }, [booking_id]);
 
   const pay = async () => {
     if (!b) return;
@@ -31,7 +38,7 @@ export default function Checkout() {
     try {
       const payment = await api<any>("/payments/create", {
         method: "POST",
-        body: { booking_id: b.booking_id, amount: total, purpose: "booking" },
+        body: { booking_id: b.booking_id, amount: total, purpose: "booking", idempotency_key: `booking_${b.booking_id}_${total}` },
       });
       router.replace(`/pay/${payment.payment_id}?method=${method}` as any);
     } catch (e: any) {
@@ -41,7 +48,20 @@ export default function Checkout() {
     }
   };
 
-  if (!b) return <View style={{ flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: c.surface }}><ActivityIndicator color={c.accent} size="large" /></View>;
+  if (!b) return (
+    <View style={{ flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: c.surface, padding: 28 }}>
+      {error ? (
+        <>
+          <Ionicons name="cloud-offline-outline" size={54} color={c.onSurface3} />
+          <Text style={{ color: c.onSurface, fontSize: 18, fontWeight: "800", marginTop: 14 }}>Could not load checkout</Text>
+          <Text style={{ color: c.onSurface3, textAlign: "center", marginTop: 6 }}>{error}</Text>
+          <Pressable onPress={load} style={[styles.retryBtn, { backgroundColor: c.inverse }]}>
+            <Text style={{ color: c.onInverse, fontWeight: "800" }}>Retry</Text>
+          </Pressable>
+        </>
+      ) : <ActivityIndicator color={c.accent} size="large" />}
+    </View>
+  );
 
   const grandTotal = b.total_amount + b.deposit;
   const methods: { key: Method; label: string; sub: string; icon: any }[] = [
@@ -132,4 +152,5 @@ const styles = StyleSheet.create({
   breakdown: { padding: 14, borderRadius: 16, borderWidth: 1 },
   footer: { position: "absolute", left: 0, right: 0, bottom: 0, padding: 14, borderTopWidth: 1 },
   payBtn: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10, paddingVertical: 16, borderRadius: 14 },
+  retryBtn: { paddingHorizontal: 20, paddingVertical: 12, borderRadius: 12, marginTop: 18 },
 });

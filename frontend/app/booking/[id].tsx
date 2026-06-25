@@ -28,10 +28,19 @@ export default function BookingScreen() {
   const [duration, setDuration] = useState(2);
   const [addOns, setAddOns] = useState<{ helmet: boolean; insurance: boolean; delivery: boolean }>({ helmet: false, insurance: true, delivery: false });
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    (async () => { try { setV(await api(`/vehicles/${id}`)); } catch {} })();
-  }, [id]);
+  const load = async () => {
+    setError(null);
+    try {
+      setV(await api(`/vehicles/${id}`));
+    } catch (e: any) {
+      setError(e.message || "Could not load booking details");
+      setV(null);
+    }
+  };
+
+  useEffect(() => { load(); }, [id]);
 
   const start = useMemo(() => new Date(), []);
   const end = useMemo(() => {
@@ -50,8 +59,11 @@ export default function BookingScreen() {
   }, [v, plan, duration]);
 
   const addOnTotal = (addOns.helmet ? 50 : 0) + (addOns.insurance ? 199 : 0) + (addOns.delivery ? 299 : 0);
-  const tax = Math.round(base * 0.18);
-  const total = base + addOnTotal + tax;
+  const platformFee = Math.max(99, Math.round(base * 0.04));
+  const insurance = addOns.insurance ? 199 : 0;
+  const tax = Math.round((base + platformFee + addOnTotal) * 0.18);
+  const total = base + platformFee + addOnTotal + tax;
+  const finalTotal = total + (v?.deposit ?? 0);
 
   const book = async () => {
     setBusy(true);
@@ -75,7 +87,20 @@ export default function BookingScreen() {
     }
   };
 
-  if (!v) return <View style={{ flex: 1, backgroundColor: c.surface, alignItems: "center", justifyContent: "center" }}><ActivityIndicator color={c.accent} size="large" /></View>;
+  if (!v) return (
+    <View style={{ flex: 1, backgroundColor: c.surface, alignItems: "center", justifyContent: "center", padding: 28 }}>
+      {error ? (
+        <>
+          <Ionicons name="cloud-offline-outline" size={54} color={c.onSurface3} />
+          <Text style={{ color: c.onSurface, fontSize: 18, fontWeight: "800", marginTop: 14 }}>Could not load booking</Text>
+          <Text style={{ color: c.onSurface3, textAlign: "center", marginTop: 6 }}>{error}</Text>
+          <Pressable onPress={load} style={[styles.retryBtn, { backgroundColor: c.inverse }]}>
+            <Text style={{ color: c.onInverse, fontWeight: "800" }}>Retry</Text>
+          </Pressable>
+        </>
+      ) : <ActivityIndicator color={c.accent} size="large" />}
+    </View>
+  );
 
   return (
     <View style={{ flex: 1, backgroundColor: c.surface }}>
@@ -128,6 +153,19 @@ export default function BookingScreen() {
           <View style={{ flex: 1, alignItems: "flex-end" }}><Text style={{ color: c.onSurface3, fontSize: 11 }}>RETURN</Text><Text style={{ color: c.onSurface, fontWeight: "700", marginTop: 2 }}>{fmt(end)}</Text></View>
         </View>
 
+        <Text style={[styles.h, { color: c.onSurface }]}>Dynamic pricing calendar</Text>
+        <View style={{ flexDirection: "row", gap: 8 }}>
+          {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((day) => {
+            const best = day === "Tue" || day === "Wed" || day === "Thu";
+            return (
+              <View key={day} style={[styles.dayCell, { backgroundColor: best ? c.accentBg : c.surface2, borderColor: best ? c.accent : c.border }]}>
+                <Text style={{ color: best ? c.onAccentBg : c.onSurface, fontWeight: "800", fontSize: 12 }}>{day}</Text>
+                <Text style={{ color: best ? c.onAccentBg : c.onSurface3, fontSize: 10 }}>{best ? "Best" : "Std"}</Text>
+              </View>
+            );
+          })}
+        </View>
+
         <Text style={[styles.h, { color: c.onSurface }]}>Add-ons</Text>
         <AddOnRow c={c} label="Helmet (bike)" price={50} value={addOns.helmet} onChange={(v: boolean) => setAddOns({ ...addOns, helmet: v })} testID="addon-helmet" />
         <AddOnRow c={c} label="Zero damage insurance" price={199} value={addOns.insurance} onChange={(v: boolean) => setAddOns({ ...addOns, insurance: v })} testID="addon-insurance" />
@@ -135,14 +173,16 @@ export default function BookingScreen() {
 
         <Text style={[styles.h, { color: c.onSurface }]}>Price breakdown</Text>
         <View style={[styles.breakdown, { backgroundColor: c.surface2, borderColor: c.border }]}>
-          <Row c={c} label={`Base · ${plan}`} val={`₹${base.toLocaleString()}`} />
-          <Row c={c} label="Add-ons" val={`₹${addOnTotal.toLocaleString()}`} />
-          <Row c={c} label="Taxes (18%)" val={`₹${tax.toLocaleString()}`} />
+          <Row c={c} label={`Base rent - ${plan}`} val={`INR ${base.toLocaleString()}`} />
+          <Row c={c} label="Platform fee" val={`INR ${platformFee.toLocaleString()}`} />
+          <Row c={c} label="Insurance" val={`INR ${insurance.toLocaleString()}`} />
+          <Row c={c} label="Other add-ons" val={`INR ${(addOnTotal - insurance).toLocaleString()}`} />
+          <Row c={c} label="Taxes (18%)" val={`INR ${tax.toLocaleString()}`} />
           <View style={{ height: 1, backgroundColor: c.border, marginVertical: 8 }} />
-          <Row c={c} label="Refundable deposit" val={`₹${v.deposit.toLocaleString()}`} sub />
+          <Row c={c} label="Refundable deposit" val={`INR ${v.deposit.toLocaleString()}`} sub />
           <View style={{ flexDirection: "row", justifyContent: "space-between", marginTop: 12 }}>
-            <Text style={{ color: c.onSurface, fontWeight: "800", fontSize: 16 }}>Total</Text>
-            <Text testID="total-amount" style={{ color: c.onSurface, fontWeight: "800", fontSize: 20 }}>₹{total.toLocaleString()}</Text>
+            <Text style={{ color: c.onSurface, fontWeight: "800", fontSize: 16 }}>Final payable</Text>
+            <Text testID="total-amount" style={{ color: c.onSurface, fontWeight: "800", fontSize: 20 }}>INR {finalTotal.toLocaleString()}</Text>
           </View>
         </View>
 
@@ -191,9 +231,11 @@ const styles = StyleSheet.create({
   row: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", padding: 16, borderRadius: 16, borderWidth: 1 },
   stepBtn: { width: 44, height: 44, borderRadius: 999, alignItems: "center", justifyContent: "center" },
   dates: { flexDirection: "row", alignItems: "center", padding: 14, borderRadius: 16, borderWidth: 1, marginTop: 12, gap: 12 },
+  dayCell: { flex: 1, alignItems: "center", paddingVertical: 10, borderRadius: 12, borderWidth: 1 },
   addRow: { flexDirection: "row", alignItems: "center", padding: 14, borderRadius: 14, borderWidth: 1, marginBottom: 8 },
   checkBox: { width: 24, height: 24, borderRadius: 6, borderWidth: 2, alignItems: "center", justifyContent: "center" },
   breakdown: { padding: 14, borderRadius: 16, borderWidth: 1 },
   footer: { position: "absolute", left: 0, right: 0, bottom: 0, padding: 14, borderTopWidth: 1 },
   payBtn: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10, paddingVertical: 16, borderRadius: 14 },
+  retryBtn: { paddingHorizontal: 20, paddingVertical: 12, borderRadius: 12, marginTop: 18 },
 });

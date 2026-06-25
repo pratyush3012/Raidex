@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { View, Text, StyleSheet, Pressable, FlatList, ActivityIndicator, RefreshControl, Alert } from "react-native";
+import { View, Text, StyleSheet, Pressable, FlatList, ActivityIndicator, RefreshControl, Alert, Platform } from "react-native";
 import { Image } from "expo-image";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
@@ -29,7 +29,7 @@ export default function TripsScreen() {
 
   const load = useCallback(async () => {
     try {
-      const data = await api<Booking[]>("/bookings");
+      const data = await api<Booking[]>("/bookings", { cache: true });
       setBookings(data);
     } catch (e) {
       setBookings([]);
@@ -50,6 +50,53 @@ export default function TripsScreen() {
   const onStart = (id: string) => router.push(`/inspection/${id}?phase=before` as any);
   const onEnd = (id: string) => router.push(`/inspection/${id}?phase=after` as any);
   const onResume = (id: string) => router.push(`/trip/${id}` as any);
+  const cancelBooking = (id: string) => {
+    Alert.alert("Cancel booking", "Cancel this booking? Refund due will be calculated by Raidex.", [
+      { text: "Keep booking", style: "cancel" },
+      {
+        text: "Cancel",
+        style: "destructive",
+        onPress: async () => {
+          try {
+            await api(`/bookings/${id}/cancel`, { method: "POST", body: { reason: "Cancelled from app" } });
+            load();
+          } catch (e: any) {
+            Alert.alert("Cancel failed", e.message || "Please try again.");
+          }
+        },
+      },
+    ]);
+  };
+  const showInvoice = async (id: string) => {
+    try {
+      const inv = await api<any>(`/bookings/${id}/invoice?gst=true`);
+      Alert.alert("Invoice ready", `Invoice ${inv.invoice_id}\nTotal: ₹${inv.total.toLocaleString()}`);
+    } catch (e: any) {
+      Alert.alert("Invoice", e.message || "Could not create invoice.");
+    }
+  };
+  const openDispute = (id: string) => {
+    if (Platform.OS === "ios" && Alert.prompt) {
+      Alert.prompt(
+        "Raise dispute",
+        "Describe the issue with this booking.",
+        async (text) => {
+          if (!text || text.trim().length < 10) return;
+          try {
+            await api(`/bookings/${id}/disputes`, { method: "POST", body: { booking_id: id, category: "other", message: text.trim() } });
+            Alert.alert("Dispute opened", "Raidex support will review this booking.");
+          } catch (e: any) {
+            Alert.alert("Dispute failed", e.message || "Please try again.");
+          }
+        }
+      );
+      return;
+    }
+    Alert.alert("Dispute", "Open support chat and share your booking ID.", [
+      { text: "Open support", onPress: () => router.push("/support" as any) },
+      { text: "Cancel", style: "cancel" },
+    ]);
+  };
 
   return (
     <View style={{ flex: 1, backgroundColor: c.surface }}>
@@ -104,10 +151,16 @@ export default function TripsScreen() {
                   </View>
                 </View>
                 {item.status === "confirmed" && (
-                  <Pressable testID={`start-trip-${item.booking_id}`} onPress={() => onStart(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.accent }]}>
-                    <Ionicons name="play" size={14} color="#fff" />
-                    <Text style={{ color: "#fff", fontWeight: "700" }}>Start Trip</Text>
-                  </Pressable>
+                  <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+                    <Pressable testID={`start-trip-${item.booking_id}`} onPress={() => onStart(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.accent, flex: 1, marginTop: 0 }]}>
+                      <Ionicons name="play" size={14} color="#fff" />
+                      <Text style={{ color: "#fff", fontWeight: "700" }}>Start</Text>
+                    </Pressable>
+                    <Pressable testID={`cancel-booking-${item.booking_id}`} onPress={() => cancelBooking(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.surface, borderWidth: 1, borderColor: c.border, flex: 1, marginTop: 0 }]}>
+                      <Ionicons name="close" size={14} color={c.error} />
+                      <Text style={{ color: c.error, fontWeight: "700" }}>Cancel</Text>
+                    </Pressable>
+                  </View>
                 )}
                 {item.status === "active" && (
                   <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
@@ -118,6 +171,18 @@ export default function TripsScreen() {
                     <Pressable testID={`end-trip-${item.booking_id}`} onPress={() => onEnd(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.inverse, flex: 1 }]}>
                       <Ionicons name="stop" size={14} color={c.onInverse} />
                       <Text style={{ color: c.onInverse, fontWeight: "700" }}>End trip</Text>
+                    </Pressable>
+                  </View>
+                )}
+                {item.status === "completed" && (
+                  <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+                    <Pressable testID={`invoice-${item.booking_id}`} onPress={() => showInvoice(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.inverse, flex: 1, marginTop: 0 }]}>
+                      <Ionicons name="receipt" size={14} color={c.onInverse} />
+                      <Text style={{ color: c.onInverse, fontWeight: "700" }}>Invoice</Text>
+                    </Pressable>
+                    <Pressable testID={`dispute-${item.booking_id}`} onPress={() => openDispute(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.surface, borderWidth: 1, borderColor: c.border, flex: 1, marginTop: 0 }]}>
+                      <Ionicons name="flag" size={14} color={c.onSurface} />
+                      <Text style={{ color: c.onSurface, fontWeight: "700" }}>Dispute</Text>
                     </Pressable>
                   </View>
                 )}

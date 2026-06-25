@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
-import { api, saveToken, clearToken, getToken } from "../api/client";
+import { api, saveToken, saveRefreshToken, clearToken, getToken } from "../api/client";
 import * as WebBrowser from "expo-web-browser";
 import * as Linking from "expo-linking";
 import * as Notifications from "expo-notifications";
@@ -106,12 +106,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           if (hashMatch) sid = decodeURIComponent(hashMatch[1]);
           else if (queryMatch) sid = decodeURIComponent(queryMatch[1]);
           if (sid) {
-            const res = await api<{ access_token: string; user: User }>("/auth/google/session", {
+            const res = await api<{ access_token: string; refresh_token?: string; user: User }>("/auth/google/session", {
               method: "POST",
               body: { session_id: sid },
               auth: false,
             });
             await saveToken(res.access_token);
+            await saveRefreshToken(res.refresh_token);
             setUser(res.user);
             try {
               globalThis.window?.history?.replaceState(null, "", globalThis.window.location.pathname);
@@ -131,23 +132,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [refresh]);
 
   const login = useCallback(async (email: string, password: string) => {
-    const res = await api<{ access_token: string; user: User }>("/auth/login", {
+    const res = await api<{ access_token: string; refresh_token?: string; user: User }>("/auth/login", {
       method: "POST",
       body: { email, password },
       auth: false,
     });
     await saveToken(res.access_token);
+    await saveRefreshToken(res.refresh_token);
     setUser(res.user);
     await registerPushToken();
   }, []);
 
   const register = useCallback(async (email: string, password: string, name: string) => {
-    const res = await api<{ access_token: string; user: User }>("/auth/register", {
+    const res = await api<{ access_token: string; refresh_token?: string; user: User }>("/auth/register", {
       method: "POST",
       body: { email, password, name },
       auth: false,
     });
     await saveToken(res.access_token);
+    await saveRefreshToken(res.refresh_token);
     setUser(res.user);
     await registerPushToken();
   }, []);
@@ -170,12 +173,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const m = result.url.match(/session_id=([^&]+)/);
     if (!m) return;
     const sid = decodeURIComponent(m[1]);
-    const res = await api<{ access_token: string; user: User }>("/auth/google/session", {
+    const res = await api<{ access_token: string; refresh_token?: string; user: User }>("/auth/google/session", {
       method: "POST",
       body: { session_id: sid },
       auth: false,
     });
     await saveToken(res.access_token);
+    await saveRefreshToken(res.refresh_token);
     setUser(res.user);
     await registerPushToken();
   }, []);

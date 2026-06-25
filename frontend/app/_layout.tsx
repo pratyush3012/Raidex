@@ -6,10 +6,15 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { StatusBar } from "expo-status-bar";
 
+import { AppErrorBoundary } from "@/src/components/AppErrorBoundary";
+import { OfflineBanner } from "@/src/components/OfflineBanner";
+import { RealtimeBridge } from "@/src/components/RealtimeBridge";
 import { useIconFonts } from "@/src/hooks/use-icon-fonts";
+import { initObservability, wrapRoot } from "@/src/observability/sentry";
 import { AuthProvider, useAuth } from "@/src/context/AuthContext";
 
 SplashScreen.preventAutoHideAsync();
+initObservability();
 
 const PROTECTED_SEGMENTS = new Set([
   "(tabs)", "vehicle", "booking", "trip", "kyc",
@@ -45,7 +50,7 @@ function AuthGate() {
   return <Stack screenOptions={{ headerShown: false, animation: "slide_from_right" }} />;
 }
 
-export default function RootLayout() {
+function RootLayout() {
   const [loaded, error] = useIconFonts();
 
   useEffect(() => {
@@ -59,11 +64,17 @@ export default function RootLayout() {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <SafeAreaProvider>
-        <AuthProvider>
-          <StatusBar style="auto" />
-          <AuthGate />
-        </AuthProvider>
+        <AppErrorBoundary>
+          <AuthProvider>
+            <StatusBar style="auto" />
+            <OfflineBanner />
+            <RealtimeBridge />
+            <AuthGate />
+          </AuthProvider>
+        </AppErrorBoundary>
       </SafeAreaProvider>
     </GestureHandlerRootView>
   );
 }
+
+export default wrapRoot(RootLayout);

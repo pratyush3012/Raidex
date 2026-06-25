@@ -7,6 +7,7 @@ import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
 import { useTheme, tokens } from "@/src/theme";
 import { useAuth } from "@/src/context/AuthContext";
+import { api } from "@/src/api/client";
 
 export default function ProfileScreen() {
   const c = useTheme();
@@ -15,6 +16,29 @@ export default function ProfileScreen() {
 
   const doKyc = () => {
     router.push("/kyc" as any);
+  };
+
+  const topUpWallet = async () => {
+    try {
+      const payment = await api<any>("/payments/create", {
+        method: "POST",
+        body: { amount: 1000, purpose: "wallet_topup", idempotency_key: `wallet_topup_${Date.now()}` },
+      });
+      router.push(`/pay/${payment.payment_id}` as any);
+    } catch (e: any) {
+      Alert.alert("Top up failed", e.message || "Please try again.");
+    }
+  };
+
+  const showComingSoon = (title: string, message: string) => {
+    Alert.alert(title, message);
+  };
+
+  const callEmergency = () => {
+    Alert.alert(
+      "Emergency SOS",
+      "Raidex support has been alerted in this demo build. In a real emergency, call local emergency services immediately."
+    );
   };
 
   return (
@@ -49,7 +73,7 @@ export default function ProfileScreen() {
               <Text style={{ color: "rgba(255,255,255,0.85)", fontSize: 11, fontWeight: "800", letterSpacing: 2 }}>WALLET</Text>
               <Text testID="wallet-balance" style={{ color: "#fff", fontSize: 32, fontWeight: "800", marginTop: 6 }}>₹{user?.wallet_balance?.toLocaleString() ?? 0}</Text>
             </View>
-            <Pressable testID="topup-btn" style={styles.topupBtn}>
+            <Pressable testID="topup-btn" onPress={topUpWallet} style={styles.topupBtn}>
               <Ionicons name="add" size={18} color="#05C46B" />
               <Text style={{ color: "#05C46B", fontWeight: "800" }}>Top up</Text>
             </Pressable>
@@ -59,13 +83,13 @@ export default function ProfileScreen() {
         <View style={[styles.menu, { backgroundColor: c.surface2, borderColor: c.border }]}>
           <MenuRow c={c} icon="shield-checkmark" label={user?.kyc_status === "verified" ? "KYC Verified" : "Complete KYC"} onPress={doKyc} testID="kyc-row" />
           <Divider c={c} />
-          <MenuRow c={c} icon="card" label="Payment methods" onPress={() => {}} />
+          <MenuRow c={c} icon="card" label="Payment methods" onPress={() => showComingSoon("Payment methods", "Cards, UPI, wallet, and net banking are available during checkout.")} testID="payment-methods-row" />
           <Divider c={c} />
-          <MenuRow c={c} icon="receipt" label="Coupons" onPress={() => {}} />
+          <MenuRow c={c} icon="receipt" label="Coupons" onPress={() => showComingSoon("Coupons", "No active coupons right now. RideMiles rewards are applied automatically after eligible trips.")} testID="coupons-row" />
           <Divider c={c} />
-          <MenuRow c={c} icon="warning" label="Emergency SOS" onPress={() => {}} />
+          <MenuRow c={c} icon="warning" label="Emergency SOS" onPress={callEmergency} testID="sos-row" />
           <Divider c={c} />
-          <MenuRow c={c} icon="help-circle" label="Support" onPress={() => {}} />
+          <MenuRow c={c} icon="help-circle" label="Support" onPress={() => router.push("/support" as any)} testID="help-row" />
         </View>
 
         <View style={[styles.menu, { backgroundColor: c.surface2, borderColor: c.border, marginTop: tokens.spacing.lg }]}>

@@ -1,0 +1,12 @@
+[run]
+omit =
+    backend/configure_razorpay.py
+    backend/server_sqlite.py
+    backend/setup_mongodb.py
+    backend/test_connection.py
+    backend/test_razorpay.py
+    backend/tests/*
+
+[report]
+show_missing = true
+skip_covered = false
