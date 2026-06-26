@@ -1,3 +1,6 @@
+// RAIDEX_FRONTEND_ROOT_LAYOUT
+// Search tags: app startup, navigation guard, protected routes, auth redirect,
+// Sentry init, offline banner, realtime bridge, splash screen.
 import { Stack, useRouter, useSegments } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { useEffect } from "react";

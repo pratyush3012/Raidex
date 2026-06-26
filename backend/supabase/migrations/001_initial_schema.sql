@@ -1,3 +1,6 @@
+-- RAIDEX_DATABASE_SCHEMA
+-- Search tags: database tables, Supabase schema, PostgreSQL schema, users,
+-- vehicles, bookings, payments, KYC, inspections, GPS, notifications, audit.
 -- ============================================================
 -- Raidex — Supabase (PostgreSQL) Initial Schema
 -- ============================================================

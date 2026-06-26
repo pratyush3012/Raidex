@@ -1,3 +1,6 @@
+# RAIDEX_BOOKING_SERVICE
+# Search tags: booking create, booking cancel, booking extend, invoice, GST invoice,
+# disputes, availability conflict, booking lifecycle business rules.
 import os
 import uuid
 from datetime import datetime

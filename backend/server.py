@@ -1,3 +1,7 @@
+# RAIDEX_BACKEND_ENTRYPOINT
+# Search tags: run backend, API routes, auth, KYC, payments, vehicles, bookings,
+# owner dashboard, admin dashboard, websocket, health check.
+# Start command: cd backend && uvicorn server:app --reload --host 0.0.0.0 --port 8000
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header, Request, WebSocket, WebSocketDisconnect, status
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware

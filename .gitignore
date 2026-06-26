@@ -83,6 +83,7 @@ backend/raidex.db
 frontend/.expo/
 .npm-cache/
 frontend/.npm-cache/
+.codex/
 .codex-export-check/
 frontend/.codex-export-check/
 
@@ -90,6 +91,7 @@ memory/test_credentials.md
 
 # Mobile development
 android-sdk/
+frontend/android/
 .env
 .env.local
 .env.development.local

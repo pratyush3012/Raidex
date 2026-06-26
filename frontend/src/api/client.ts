@@ -1,3 +1,6 @@
+// RAIDEX_FRONTEND_API_CLIENT
+// Search tags: backend URL, auth token, refresh token, API calls, request timeout,
+// offline cache, retry queue, network failure handling.
 import * as SecureStore from "expo-secure-store";
 import { Platform } from "react-native";
 import { captureError } from "../observability/sentry";
