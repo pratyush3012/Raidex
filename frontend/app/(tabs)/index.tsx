@@ -47,6 +47,7 @@ const CATS = [
 ];
 
 const SMART_PROMPTS = ["Bike under Rs 1000 near me", "EV within 5 km", "Cars for weekend trip"];
+const RADIUS_OPTIONS = [2, 5, 10, 20];
 
 export default function HomeScreen() {
   const c = useTheme();
@@ -211,7 +212,7 @@ export default function HomeScreen() {
             <View style={{ marginBottom: tokens.spacing.lg, gap: 14 }}>
               <DiscoveryModeSwitch c={c} mode={discoveryMode} onChange={setDiscoveryMode} />
               {discoveryMode === "map" ? (
-                <NearbyMap c={c} items={items} onRefresh={fetchData} onSelect={(vehicleId: string) => router.push(`/vehicle/${vehicleId}`)} />
+                <PremiumNearbyMap c={c} items={items} onRefresh={fetchData} onSelect={(vehicleId: string) => router.push(`/vehicle/${vehicleId}`)} />
               ) : (
                 <NoMapDiscovery c={c} items={items} onRefresh={fetchData} />
               )}
@@ -328,6 +329,109 @@ function ModeButton({ c, active, icon, label, onPress }: any) {
       <Ionicons name={icon} size={15} color={active ? c.onInverse : c.onSurface2} />
       <Text style={{ color: active ? c.onInverse : c.onSurface2, fontWeight: "900", fontSize: 13 }}>{label}</Text>
     </Pressable>
+  );
+}
+
+function PremiumNearbyMap({ c, items, onRefresh, onSelect }: any) {
+  const [radiusKm, setRadiusKm] = useState(5);
+  const [selectedId, setSelectedId] = useState<string | null>(items[0]?.vehicle_id ?? null);
+  const centerLat = items.length ? items.reduce((sum: number, v: Vehicle) => sum + v.latitude, 0) / items.length : 19.076;
+  const centerLng = items.length ? items.reduce((sum: number, v: Vehicle) => sum + v.longitude, 0) / items.length : 72.8777;
+  const visibleItems = useMemo(() => items.filter((item: Vehicle) => (Number(item.distance_km) || 99) <= radiusKm), [items, radiusKm]);
+  const selected = visibleItems.find((item: Vehicle) => item.vehicle_id === selectedId) || visibleItems[0] || items[0];
+
+  useEffect(() => {
+    if (!selectedId && visibleItems[0]) setSelectedId(visibleItems[0].vehicle_id);
+    if (selectedId && visibleItems.length && !visibleItems.some((item: Vehicle) => item.vehicle_id === selectedId)) {
+      setSelectedId(visibleItems[0].vehicle_id);
+    }
+  }, [selectedId, visibleItems]);
+
+  return (
+    <View style={[styles.liveMapWrap, { backgroundColor: c.surface2, borderColor: c.border }]}>
+      <LinearGradient colors={["#050505", "#14201A"]} style={styles.liveMapTop}>
+        <View style={styles.mapHeader}>
+          <View>
+            <Text style={styles.liveMapTitle}>Nearby rides</Text>
+            <Text style={styles.liveMapSubtitle}>{visibleItems.length} vehicles within {radiusKm} km</Text>
+          </View>
+          <Pressable testID="map-refresh" onPress={onRefresh} style={styles.liveRefresh}>
+            <Ionicons name="refresh" size={18} color="#fff" />
+          </Pressable>
+        </View>
+        <View style={styles.radiusRow}>
+          {RADIUS_OPTIONS.map((km) => (
+            <Pressable key={km} testID={`radius-${km}`} onPress={() => setRadiusKm(km)}
+              style={[styles.radiusChip, { backgroundColor: radiusKm === km ? "#fff" : "rgba(255,255,255,0.12)", borderColor: "rgba(255,255,255,0.18)" }]}>
+              <Text style={{ color: radiusKm === km ? "#050505" : "#fff", fontWeight: "900", fontSize: 12 }}>{km} km</Text>
+            </Pressable>
+          ))}
+        </View>
+      </LinearGradient>
+
+      <PremiumMapCanvas c={c} items={visibleItems} centerLat={centerLat} centerLng={centerLng} selectedId={selected?.vehicle_id} onSelect={setSelectedId} />
+
+      {selected ? (
+        <Pressable testID="selected-map-vehicle" onPress={() => onSelect(selected.vehicle_id)}
+          style={[styles.mapVehicleCard, { backgroundColor: c.surface, borderColor: c.border }]}>
+          <Image source={selected.image} style={styles.mapVehicleImage} contentFit="cover" />
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: c.onSurface, fontWeight: "900", fontSize: 15 }} numberOfLines={1}>{selected.name}</Text>
+            <View style={styles.mapMetaRow}>
+              <Ionicons name="star" size={12} color="#F59E0B" />
+              <Text style={{ color: c.onSurface2, fontWeight: "800", fontSize: 12 }}>{selected.rating.toFixed(1)}</Text>
+              <Text style={{ color: c.onSurface3, fontSize: 12 }}>|</Text>
+              <Text style={{ color: c.onSurface2, fontWeight: "800", fontSize: 12 }}>{selected.distance_km} km away</Text>
+            </View>
+            <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 4 }} numberOfLines={1}>{selected.location}</Text>
+          </View>
+          <View style={{ alignItems: "flex-end" }}>
+            <Text style={{ color: c.onSurface, fontWeight: "900", fontSize: 16 }}>Rs {selected.price_per_day.toLocaleString()}</Text>
+            <Text style={{ color: c.onSurface3, fontSize: 11 }}>per day</Text>
+            <View style={[styles.instantBadge, { backgroundColor: selected.instant_book === false ? c.surface2 : c.accentBg }]}>
+              <Text style={{ color: selected.instant_book === false ? c.onSurface3 : c.onAccentBg, fontSize: 10, fontWeight: "900" }}>
+                {selected.instant_book === false ? "Request" : "Instant"}
+              </Text>
+            </View>
+          </View>
+        </Pressable>
+      ) : null}
+    </View>
+  );
+}
+
+function PremiumMapCanvas({ c, items, centerLat, centerLng, selectedId, onSelect }: any) {
+  return (
+    <LinearGradient colors={["#111827", "#0F172A", "#13251B"]} style={styles.premiumMapCanvas}>
+      <View style={styles.mapRoadA} />
+      <View style={styles.mapRoadB} />
+      <View style={styles.mapRoadC} />
+      <View style={styles.userRange} />
+      <View style={styles.userLocator}>
+        <View style={styles.userPulse} />
+        <Ionicons name="navigate" size={16} color="#fff" />
+      </View>
+      {items.slice(0, 24).map((item: Vehicle, index: number) => {
+        const left = Math.max(8, Math.min(84, 50 + (item.longitude - centerLng) * 900 + ((index % 3) - 1) * 5));
+        const top = Math.max(12, Math.min(78, 50 - (item.latitude - centerLat) * 1300 + ((index % 4) - 1.5) * 4));
+        const active = item.vehicle_id === selectedId;
+        return (
+          <Pressable key={item.vehicle_id} testID={`map-pin-${item.vehicle_id}`} onPress={() => onSelect(item.vehicle_id)}
+            style={[styles.ridePin, { left: `${left}%`, top: `${top}%`, backgroundColor: active ? "#05C46B" : "#fff", transform: [{ scale: active ? 1.08 : 1 }] }]}>
+            <Ionicons name={item.type === "bike" ? "bicycle" : "car-sport"} size={13} color={active ? "#fff" : "#050505"} />
+            <Text style={{ color: active ? "#fff" : "#050505", fontWeight: "900", fontSize: 10 }}>Rs {Math.round(item.price_per_day / 1000)}k</Text>
+          </Pressable>
+        );
+      })}
+      <View style={styles.mapLegend}>
+        <View style={styles.liveDotSmall} />
+        <Text style={styles.mapLegendText}>Live availability</Text>
+      </View>
+      <View style={styles.demandBadge}>
+        <Ionicons name="flash" size={13} color="#050505" />
+        <Text style={styles.demandText}>High demand zone</Text>
+      </View>
+    </LinearGradient>
   );
 }
 
@@ -543,6 +647,30 @@ const styles = StyleSheet.create({
   pill: { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
   modeSwitch: { flexDirection: "row", borderRadius: 16, borderWidth: 1, padding: 4 },
   modeButton: { flex: 1, height: 40, borderRadius: 12, alignItems: "center", justifyContent: "center", flexDirection: "row", gap: 7 },
+  liveMapWrap: { borderRadius: 24, borderWidth: 1, overflow: "hidden" },
+  liveMapTop: { padding: 16, paddingBottom: 13 },
+  liveMapTitle: { color: "#fff", fontSize: 20, fontWeight: "900" },
+  liveMapSubtitle: { color: "rgba(255,255,255,0.68)", fontSize: 12, marginTop: 3, fontWeight: "700" },
+  liveRefresh: { width: 40, height: 40, borderRadius: 999, alignItems: "center", justifyContent: "center", backgroundColor: "rgba(255,255,255,0.14)", borderWidth: 1, borderColor: "rgba(255,255,255,0.2)" },
+  radiusRow: { flexDirection: "row", gap: 8, marginTop: 14 },
+  radiusChip: { borderWidth: 1, borderRadius: 999, paddingHorizontal: 13, paddingVertical: 7 },
+  premiumMapCanvas: { height: 270, margin: 12, borderRadius: 22, overflow: "hidden", position: "relative" },
+  mapRoadA: { position: "absolute", left: -40, right: -40, top: "42%", height: 28, borderRadius: 30, backgroundColor: "rgba(255,255,255,0.08)", transform: [{ rotate: "-18deg" }] },
+  mapRoadB: { position: "absolute", left: "38%", top: -40, bottom: -40, width: 24, borderRadius: 30, backgroundColor: "rgba(255,255,255,0.07)", transform: [{ rotate: "22deg" }] },
+  mapRoadC: { position: "absolute", left: -30, right: -20, top: "66%", height: 18, borderRadius: 30, backgroundColor: "rgba(5,196,107,0.12)", transform: [{ rotate: "10deg" }] },
+  userRange: { position: "absolute", left: "31%", top: "29%", width: 150, height: 150, borderRadius: 999, borderWidth: 1, borderColor: "rgba(5,196,107,0.36)", backgroundColor: "rgba(5,196,107,0.08)" },
+  userLocator: { position: "absolute", left: "46%", top: "45%", width: 42, height: 42, borderRadius: 999, alignItems: "center", justifyContent: "center", backgroundColor: "#05C46B", borderWidth: 3, borderColor: "#fff", shadowColor: "#05C46B", shadowOpacity: 0.45, shadowRadius: 14, elevation: 5 },
+  userPulse: { position: "absolute", width: 72, height: 72, borderRadius: 999, backgroundColor: "rgba(5,196,107,0.16)" },
+  ridePin: { position: "absolute", minWidth: 58, height: 34, borderRadius: 999, alignItems: "center", justifyContent: "center", flexDirection: "row", gap: 4, paddingHorizontal: 8, borderWidth: 2, borderColor: "rgba(255,255,255,0.9)", shadowColor: "#000", shadowOpacity: 0.24, shadowRadius: 10, elevation: 4 },
+  mapLegend: { position: "absolute", left: 14, top: 14, flexDirection: "row", alignItems: "center", gap: 7, backgroundColor: "rgba(0,0,0,0.42)", borderRadius: 999, paddingHorizontal: 11, paddingVertical: 7 },
+  liveDotSmall: { width: 7, height: 7, borderRadius: 99, backgroundColor: "#05C46B" },
+  mapLegendText: { color: "#fff", fontWeight: "800", fontSize: 11 },
+  demandBadge: { position: "absolute", right: 14, bottom: 14, flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: "#fff", borderRadius: 999, paddingHorizontal: 11, paddingVertical: 7 },
+  demandText: { color: "#050505", fontSize: 11, fontWeight: "900" },
+  mapVehicleCard: { marginHorizontal: 12, marginBottom: 12, borderWidth: 1, borderRadius: 18, padding: 10, flexDirection: "row", alignItems: "center", gap: 10 },
+  mapVehicleImage: { width: 70, height: 62, borderRadius: 14 },
+  mapMetaRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 5 },
+  instantBadge: { marginTop: 8, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 4 },
   mapWrap: { borderRadius: 22, borderWidth: 1, padding: 14 },
   mapHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 },
   mapCanvas: { height: 240, borderRadius: 18, overflow: "hidden", position: "relative" },

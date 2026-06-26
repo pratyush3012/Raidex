@@ -102,6 +102,18 @@ def init_db():
                 created_at TEXT
             )
         """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS phone_otp_challenges (
+                challenge_id TEXT PRIMARY KEY,
+                phone TEXT NOT NULL,
+                otp TEXT NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                used INTEGER DEFAULT 0,
+                created_at TEXT,
+                expires_at TEXT
+            )
+        """)
         
         # Vehicles table
         cursor.execute("""
@@ -279,6 +291,17 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class PhoneOtpRequest(BaseModel):
+    phone: str = Field(min_length=10, max_length=16)
+
+
+class PhoneOtpVerifyRequest(BaseModel):
+    challenge_id: str = Field(min_length=8, max_length=80)
+    phone: str = Field(min_length=10, max_length=16)
+    otp: str = Field(min_length=4, max_length=8)
+    name: Optional[str] = Field(default=None, max_length=80)
+
+
 class TokenResp(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -340,6 +363,17 @@ def serialize_user(row: dict) -> dict:
     u = dict(row)
     u.pop("password_hash", None)
     return u
+
+
+def normalize_phone(phone: str) -> str:
+    cleaned = "".join(ch for ch in phone.strip() if ch.isdigit() or ch == "+")
+    if cleaned.startswith("00"):
+        cleaned = "+" + cleaned[2:]
+    if len(cleaned) == 10 and cleaned[0] in "6789":
+        cleaned = "+91" + cleaned
+    if not cleaned.startswith("+") or len(cleaned) < 11:
+        raise HTTPException(status_code=422, detail="Enter a valid phone number with country code")
+    return cleaned
 
 
 def parse_vehicle(row: dict) -> dict:
@@ -548,6 +582,62 @@ async def login(request: Request, payload: LoginRequest):
         user_dict = dict(user)
         user_dict.pop("password_hash", None)
         
+        return TokenResp(access_token=token, user=user_dict)
+
+
+@api_router.post("/auth/phone/request-otp")
+@limiter.limit("8/minute")
+async def request_phone_otp(request: Request, payload: PhoneOtpRequest):
+    phone = normalize_phone(payload.phone)
+    otp = f"{uuid.uuid4().int % 1_000_000:06d}"
+    challenge_id = "otp_" + uuid.uuid4().hex[:18]
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO phone_otp_challenges (challenge_id, phone, otp, attempts, used, created_at, expires_at)
+            VALUES (?, ?, ?, 0, 0, ?, ?)
+        """, (challenge_id, phone, otp, utc_now(), expires_at))
+    response = {"challenge_id": challenge_id, "expires_in": 300}
+    if os.getenv("SMS_PROVIDER", "mock").lower() == "mock":
+        response["dev_otp"] = otp
+    return response
+
+
+@api_router.post("/auth/phone/verify-otp", response_model=TokenResp)
+@limiter.limit("10/minute")
+async def verify_phone_otp(request: Request, payload: PhoneOtpVerifyRequest):
+    phone = normalize_phone(payload.phone)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM phone_otp_challenges WHERE challenge_id = ? AND phone = ?", (payload.challenge_id, phone))
+        challenge = cursor.fetchone()
+        if not challenge or int(challenge["used"] or 0) == 1:
+            raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+        expires_at = datetime.fromisoformat(str(challenge["expires_at"]).replace("Z", "+00:00"))
+        if expires_at < datetime.now(timezone.utc):
+            raise HTTPException(status_code=400, detail="OTP expired")
+        if int(challenge["attempts"] or 0) >= 5:
+            raise HTTPException(status_code=429, detail="Too many OTP attempts")
+        if payload.otp.strip() != challenge["otp"]:
+            cursor.execute("UPDATE phone_otp_challenges SET attempts = attempts + 1 WHERE challenge_id = ?", (payload.challenge_id,))
+            raise HTTPException(status_code=400, detail="Incorrect OTP")
+
+        cursor.execute("SELECT * FROM users WHERE phone = ?", (phone,))
+        user = cursor.fetchone()
+        if not user:
+            user_id = "usr_" + uuid.uuid4().hex[:12]
+            email = f"{phone.replace('+', '')}@phone.raidex.local"
+            display_name = payload.name.strip() if payload.name else f"Rider {phone[-4:]}"
+            cursor.execute("""
+                INSERT INTO users (user_id, email, name, password_hash, phone, created_at, kyc_status, wallet_balance, ride_miles, tier)
+                VALUES (?, ?, ?, NULL, ?, ?, 'verified', 500.0, 250, 'Silver')
+            """, (user_id, email, display_name, phone, utc_now()))
+            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            user = cursor.fetchone()
+        cursor.execute("UPDATE phone_otp_challenges SET used = 1 WHERE challenge_id = ?", (payload.challenge_id,))
+        user_dict = serialize_user(dict(user))
+        token = create_token(user_dict["user_id"], user_dict["email"])
         return TokenResp(access_token=token, user=user_dict)
 
 

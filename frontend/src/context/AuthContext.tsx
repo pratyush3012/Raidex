@@ -1,7 +1,5 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
 import { api, saveToken, saveRefreshToken, clearToken, getToken } from "../api/client";
-import * as WebBrowser from "expo-web-browser";
-import * as Linking from "expo-linking";
 import * as Notifications from "expo-notifications";
 import Constants from "expo-constants";
 import { Platform } from "react-native";
@@ -24,6 +22,9 @@ type AuthState = {
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string, name: string) => Promise<void>;
   loginWithGoogle: () => Promise<void>;
+  loginWithApple: () => Promise<void>;
+  requestPhoneOtp: (phone: string) => Promise<{ challenge_id: string; expires_in: number; dev_otp?: string }>;
+  verifyPhoneOtp: (challengeId: string, phone: string, otp: string, name?: string) => Promise<void>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
 };
@@ -156,26 +157,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const loginWithGoogle = useCallback(async () => {
-    let redirectUrl: string;
-    if (Platform.OS === "web") {
-      redirectUrl = globalThis.window.location.origin + "/";
-    } else {
-      redirectUrl = Linking.createURL("auth");
-    }
-    const authUrl = `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirectUrl)}`;
+    throw new Error("Google sign-in is now app-owned. Configure Google OAuth client IDs in backend before enabling live login.");
+  }, []);
 
-    if (Platform.OS === "web") {
-      globalThis.window.location.href = authUrl;
-      return;
-    }
-    const result = await WebBrowser.openAuthSessionAsync(authUrl, redirectUrl);
-    if (result.type !== "success" || !result.url) return;
-    const m = result.url.match(/session_id=([^&]+)/);
-    if (!m) return;
-    const sid = decodeURIComponent(m[1]);
-    const res = await api<{ access_token: string; refresh_token?: string; user: User }>("/auth/google/session", {
+  const loginWithApple = useCallback(async () => {
+    throw new Error("Apple sign-in needs an Apple Developer configuration before live login.");
+  }, []);
+
+  const requestPhoneOtp = useCallback(async (phone: string) => {
+    return api<{ challenge_id: string; expires_in: number; dev_otp?: string }>("/auth/phone/request-otp", {
       method: "POST",
-      body: { session_id: sid },
+      body: { phone },
+      auth: false,
+    });
+  }, []);
+
+  const verifyPhoneOtp = useCallback(async (challengeId: string, phone: string, otp: string, name?: string) => {
+    const res = await api<{ access_token: string; refresh_token?: string; user: User }>("/auth/phone/verify-otp", {
+      method: "POST",
+      body: { challenge_id: challengeId, phone, otp, name },
       auth: false,
     });
     await saveToken(res.access_token);
@@ -194,7 +194,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <AuthCtx.Provider value={{ user, loading, login, register, loginWithGoogle, logout, refresh }}>
+    <AuthCtx.Provider value={{ user, loading, login, register, loginWithGoogle, loginWithApple, requestPhoneOtp, verifyPhoneOtp, logout, refresh }}>
       {children}
     </AuthCtx.Provider>
   );

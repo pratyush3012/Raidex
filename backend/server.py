@@ -239,6 +239,15 @@ class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
+class PhoneOtpRequest(BaseModel):
+    phone: str = Field(min_length=10, max_length=16)
+
+class PhoneOtpVerifyRequest(BaseModel):
+    challenge_id: str = Field(min_length=8, max_length=80)
+    phone: str = Field(min_length=10, max_length=16)
+    otp: str = Field(min_length=4, max_length=8)
+    name: Optional[str] = Field(default=None, max_length=80)
+
 class TokenResp(BaseModel):
     access_token: str
     refresh_token: Optional[str] = None
@@ -443,6 +452,16 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
 
 def serialize_user(u: dict) -> dict:
     return {k: v for k, v in u.items() if k != "password_hash" and k != "_id"}
+
+def normalize_phone(phone: str) -> str:
+    cleaned = "".join(ch for ch in phone.strip() if ch.isdigit() or ch == "+")
+    if cleaned.startswith("00"):
+        cleaned = "+" + cleaned[2:]
+    if len(cleaned) == 10 and cleaned[0] in "6789":
+        cleaned = "+91" + cleaned
+    if not cleaned.startswith("+") or len(cleaned) < 11:
+        raise HTTPException(status_code=422, detail="Enter a valid phone number with country code")
+    return cleaned
 
 
 # ============================================================
@@ -684,6 +703,70 @@ async def login(request: Request, payload: LoginRequest):
     if not _verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=400, detail="Invalid email or password")
     token = create_token(user["user_id"], email)
+    refresh_token = await create_refresh_session(user, request)
+    return TokenResp(access_token=token, refresh_token=refresh_token, user=serialize_user(user))
+
+
+@api_router.post("/auth/phone/request-otp")
+@limiter.limit("8/minute")
+async def request_phone_otp(request: Request, payload: PhoneOtpRequest):
+    phone = normalize_phone(payload.phone)
+    otp = f"{uuid.uuid4().int % 1_000_000:06d}"
+    challenge_id = "otp_" + uuid.uuid4().hex[:18]
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    await db.phone_otp_challenges.insert_one({
+        "challenge_id": challenge_id,
+        "phone": phone,
+        "otp": otp,
+        "attempts": 0,
+        "used": False,
+        "created_at": utc_now(),
+        "expires_at": expires_at.isoformat(),
+        "ip": get_remote_address(request),
+    })
+    response = {"challenge_id": challenge_id, "expires_in": 300}
+    if os.getenv("SMS_PROVIDER", "mock").lower() == "mock":
+        response["dev_otp"] = otp
+    return response
+
+
+@api_router.post("/auth/phone/verify-otp", response_model=TokenResp)
+@limiter.limit("10/minute")
+async def verify_phone_otp(request: Request, payload: PhoneOtpVerifyRequest):
+    phone = normalize_phone(payload.phone)
+    challenge = await db.phone_otp_challenges.find_one({"challenge_id": payload.challenge_id, "phone": phone}, {"_id": 0})
+    if not challenge or challenge.get("used"):
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+    expires_at = datetime.fromisoformat(str(challenge["expires_at"]).replace("Z", "+00:00"))
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="OTP expired")
+    if int(challenge.get("attempts", 0)) >= 5:
+        raise HTTPException(status_code=429, detail="Too many OTP attempts")
+    if payload.otp.strip() != challenge["otp"]:
+        await db.phone_otp_challenges.update_one({"challenge_id": payload.challenge_id}, {"$inc": {"attempts": 1}})
+        raise HTTPException(status_code=400, detail="Incorrect OTP")
+
+    user = await db.users.find_one({"phone": phone}, {"_id": 0})
+    if not user:
+        user_id = "usr_" + uuid.uuid4().hex[:12]
+        display_name = payload.name.strip() if payload.name else f"Rider {phone[-4:]}"
+        user = {
+            "user_id": user_id,
+            "email": f"{phone.replace('+', '')}@phone.raidex.local",
+            "name": display_name,
+            "password_hash": None,
+            "avatar": None,
+            "phone": phone,
+            "role": "customer",
+            "kyc_status": "pending",
+            "wallet_balance": 500.0,
+            "ride_miles": 250,
+            "tier": "Silver",
+            "created_at": utc_now(),
+        }
+        await db.users.insert_one(user)
+    await db.phone_otp_challenges.update_one({"challenge_id": payload.challenge_id}, {"$set": {"used": True, "verified_at": utc_now()}})
+    token = create_token(user["user_id"], user["email"])
     refresh_token = await create_refresh_session(user, request)
     return TokenResp(access_token=token, refresh_token=refresh_token, user=serialize_user(user))
 
