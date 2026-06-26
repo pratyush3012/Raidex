@@ -1,0 +1,29 @@
+{
+  "policy": {
+    "allowed": "Study public product patterns and write original Raidex recommendations.",
+    "forbidden": "Do not copy proprietary code, branding, assets, screenshots, or protected designs."
+  },
+  "focus_areas": [
+    "navigation",
+    "booking flow",
+    "search",
+    "filters",
+    "vehicle discovery",
+    "trust indicators",
+    "payments",
+    "maps",
+    "owner experience",
+    "customer experience",
+    "performance",
+    "accessibility",
+    "transparency"
+  ],
+  "public_product_categories": [
+    "ride-hailing apps",
+    "car rental apps",
+    "bike rental apps",
+    "mobility subscription products",
+    "fleet owner dashboards"
+  ],
+  "evidence_rule": "Benchmark recommendations must cite the observed public pattern or mark evidence as missing."
+}

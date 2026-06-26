@@ -29,56 +29,56 @@
       "name": "AI CTO",
       "model_role": "general",
       "write_access": false,
-      "duties": ["review project health", "set priorities", "generate daily engineering reports"]
+      "duties": ["review project health", "set priorities", "generate daily engineering reports", "create weekly priorities", "review technical debt"]
     },
     {
       "id": "architect",
       "name": "AI Architect",
       "model_role": "reasoning",
       "write_access": false,
-      "duties": ["review architecture", "detect technical debt", "suggest refactoring"]
+      "duties": ["review architecture", "detect technical debt", "suggest refactoring", "detect duplicate logic", "reduce complexity"]
     },
     {
       "id": "backend",
       "name": "AI Backend Engineer",
       "model_role": "primary_coding",
       "write_access": true,
-      "duties": ["review backend", "find bugs", "suggest improvements"]
+      "duties": ["review backend", "find bugs", "suggest improvements", "optimize queries", "improve API security", "add backend tests"]
     },
     {
       "id": "frontend",
       "name": "AI Frontend Engineer",
       "model_role": "primary_coding",
       "write_access": true,
-      "duties": ["review UI/UX", "review accessibility", "review frontend performance"]
+      "duties": ["review UI/UX", "review accessibility", "review frontend performance", "review responsiveness", "review navigation", "benchmark public mobility UX patterns without copying proprietary designs"]
     },
     {
       "id": "qa",
       "name": "AI QA Engineer",
       "model_role": "lightweight",
       "write_access": false,
-      "duties": ["run tests", "generate bug reports", "watch test failures"]
+      "duties": ["run unit tests", "run integration tests", "run regression tests", "run fuzz tests where appropriate", "generate reproducible bug reports", "watch authentication KYC payments maps notifications bookings wallet coupons referrals owner admin offline realtime"]
     },
     {
       "id": "security",
       "name": "AI Security Engineer",
       "model_role": "reasoning",
       "write_access": false,
-      "duties": ["run dependency scans", "review secrets", "review authentication"]
+      "duties": ["run dependency scans", "review secrets", "review authentication", "review authorization", "review OWASP risks", "review rate limiting"]
     },
     {
       "id": "devops",
       "name": "AI DevOps Engineer",
       "model_role": "general",
       "write_access": false,
-      "duties": ["review CI/CD", "review deployments", "review build health"]
+      "duties": ["review CI/CD", "review deployments", "review build health", "review coverage", "review artifacts", "review Android build readiness"]
     },
     {
       "id": "product",
       "name": "AI Product Analyst",
       "model_role": "general",
       "write_access": false,
-      "duties": ["review analytics", "review user feedback", "suggest product improvements"]
+      "duties": ["review analytics", "review user feedback", "review crash analytics", "review booking conversion", "review retention", "suggest product improvements backed by data"]
     }
   ]
 }

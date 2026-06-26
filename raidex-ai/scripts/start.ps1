@@ -27,4 +27,4 @@ if (-not (Get-Process -Name "ollama" -ErrorAction SilentlyContinue)) {
 }
 
 python .\raidex-ai\scripts\raidex_ai.py doctor
-python .\raidex-ai\scripts\raidex_ai.py watch --interval 60
+python .\raidex-ai\scripts\raidex_ai.py continuous --interval 1800

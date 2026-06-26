@@ -1,6 +1,6 @@
 # Raidex AI Engineering Platform
 
-This workspace runs local AI engineering agents for Raidex development, testing, code quality, security, monitoring, and reporting.
+This workspace runs a local AI Engineering Operating System for Raidex development, testing, code quality, security, monitoring, memory, RAG search, and reporting.
 
 Start here:
 

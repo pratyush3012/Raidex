@@ -16,7 +16,7 @@ Reviews FastAPI backend, business logic, API behavior, database usage, and backe
 
 ## AI Frontend Engineer
 
-Reviews React Native screens, UI/UX, accessibility, navigation, API handling, and rendering performance.
+Reviews React Native screens, UI/UX, accessibility, navigation, API handling, rendering performance, and public mobility-app UX patterns. It may propose original Raidex improvements, but must not copy proprietary assets, code, branding, or protected designs.
 
 ## AI QA Engineer
 
@@ -44,6 +44,8 @@ Read access:
 - Logs
 - Dependency metadata
 - Database docs and local dev DB in read-only mode by default
+- Local long-term memory and local RAG index
+- GitHub Issues and Pull Requests through `gh` when authenticated
 
 Write access:
 
@@ -57,3 +59,5 @@ Forbidden:
 - Automatic deployments
 - Production database mutation
 - Destructive filesystem cleanup
+- Real payments or refunds
+- Production secret changes

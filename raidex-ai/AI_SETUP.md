@@ -32,6 +32,7 @@ The setup script:
 - Detects hardware capacity.
 - Pulls hardware-compatible models.
 - Runs a platform doctor check.
+- Creates local memory and RAG directories on first run.
 
 ## Start
 
@@ -58,11 +59,21 @@ powershell -ExecutionPolicy Bypass -File .\raidex-ai\scripts\stop.ps1
 ```powershell
 python .\raidex-ai\scripts\raidex_ai.py doctor
 python .\raidex-ai\scripts\raidex_ai.py pull-models
+python .\raidex-ai\scripts\raidex_ai.py index
+python .\raidex-ai\scripts\raidex_ai.py search "booking payment failures"
+python .\raidex-ai\scripts\raidex_ai.py memory-update
 python .\raidex-ai\scripts\raidex_ai.py checks
 python .\raidex-ai\scripts\raidex_ai.py daily-report
+python .\raidex-ai\scripts\raidex_ai.py daily-bug-report
 python .\raidex-ai\scripts\raidex_ai.py weekly-architecture-report
 python .\raidex-ai\scripts\raidex_ai.py security-report
 python .\raidex-ai\scripts\raidex_ai.py performance-report
+python .\raidex-ai\scripts\raidex_ai.py weekly-product-report
+python .\raidex-ai\scripts\raidex_ai.py benchmark-report
+python .\raidex-ai\scripts\raidex_ai.py monthly-technical-debt-report
+python .\raidex-ai\scripts\raidex_ai.py monthly-roadmap
+python .\raidex-ai\scripts\raidex_ai.py continuous-once
+python .\raidex-ai\scripts\raidex_ai.py continuous --interval 1800
 python .\raidex-ai\scripts\raidex_ai.py agent security
 python .\raidex-ai\scripts\raidex_ai.py watch --interval 60
 ```
@@ -84,8 +95,36 @@ powershell -ExecutionPolicy Bypass -File .\raidex-ai\scripts\install-scheduled-t
 This creates:
 
 - Daily engineering report
+- Daily bug report
 - Weekly architecture report
 - Weekly security report
+- Weekly product report
+- Monthly technical debt report
+
+## Email Reports
+
+Reports are addressed to `pratyushsharma1209@gmail.com` by default, but the platform does not hardcode SMTP secrets.
+
+Set these environment variables to enable delivery:
+
+```powershell
+$env:RAIDEX_AI_REPORT_EMAIL="pratyushsharma1209@gmail.com"
+$env:SMTP_HOST="smtp.example.com"
+$env:SMTP_PORT="587"
+$env:SMTP_USER="..."
+$env:SMTP_PASSWORD="..."
+$env:SMTP_FROM="..."
+```
+
+If SMTP is unavailable, reports are saved locally and marked as not emailed.
+
+## Memory And RAG
+
+- Memory file: `raidex-ai\memory\project-memory.json`
+- Event log: `raidex-ai\memory\events.jsonl`
+- Local index: `raidex-ai\index\code-index.jsonl`
+
+The index stores local hashed token embeddings. No code is sent to a third-party embedding service.
 
 ## Safety
 
