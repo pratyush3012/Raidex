@@ -47,6 +47,7 @@ const CATS = [
 ];
 
 const SMART_PROMPTS = ["Bike under Rs 1000 near me", "EV within 5 km", "Cars for weekend trip"];
+const HAS_ANDROID_MAPS_KEY = Boolean(process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY?.trim());
 
 export default function HomeScreen() {
   const c = useTheme();
@@ -327,7 +328,7 @@ function NearbyMap({ c, items, onRefresh, onSelect }: any) {
           <Ionicons name="refresh" size={18} color={c.onSurface} />
         </Pressable>
       </View>
-      {Platform.OS === "web" ? (
+      {Platform.OS === "web" || (Platform.OS === "android" && !HAS_ANDROID_MAPS_KEY) ? (
         <FallbackMap c={c} items={items} centerLat={centerLat} centerLng={centerLng} onSelect={onSelect} />
       ) : (
         <MapView style={styles.mapCanvas} initialRegion={region} showsUserLocation showsMyLocationButton>
