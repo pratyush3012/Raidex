@@ -8,7 +8,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
-import MapView, { Circle, Marker } from "react-native-maps";
+import { WebView } from "react-native-webview";
 
 import { api } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
@@ -47,7 +47,6 @@ const CATS = [
 ];
 
 const SMART_PROMPTS = ["Bike under Rs 1000 near me", "EV within 5 km", "Cars for weekend trip"];
-const HAS_ANDROID_MAPS_KEY = Boolean(process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY?.trim());
 
 export default function HomeScreen() {
   const c = useTheme();
@@ -60,6 +59,7 @@ export default function HomeScreen() {
   const [distance, setDistance] = useState<"any" | "2" | "5" | "10">("any");
   const [fuel, setFuel] = useState<"any" | "EV" | "Petrol" | "Diesel">("any");
   const [sort, setSort] = useState<"distance" | "price" | "rating">("distance");
+  const [discoveryMode, setDiscoveryMode] = useState<"map" | "list">("map");
   const [items, setItems] = useState<Vehicle[]>([]);
   const [compareIds, setCompareIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
@@ -209,7 +209,12 @@ export default function HomeScreen() {
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={c.accent} />}
           ListHeaderComponent={
             <View style={{ marginBottom: tokens.spacing.lg, gap: 14 }}>
-              <NearbyMap c={c} items={items} onRefresh={fetchData} onSelect={(vehicleId: string) => router.push(`/vehicle/${vehicleId}`)} />
+              <DiscoveryModeSwitch c={c} mode={discoveryMode} onChange={setDiscoveryMode} />
+              {discoveryMode === "map" ? (
+                <NearbyMap c={c} items={items} onRefresh={fetchData} onSelect={(vehicleId: string) => router.push(`/vehicle/${vehicleId}`)} />
+              ) : (
+                <NoMapDiscovery c={c} items={items} onRefresh={fetchData} />
+              )}
               {compareIds.length > 0 && (
                 <View style={[styles.compareBar, { backgroundColor: c.surface2, borderColor: c.border }]}>
                   <Text style={{ color: c.onSurface, fontWeight: "800", flex: 1 }}>{compareIds.length} selected for compare</Text>
@@ -308,48 +313,188 @@ function FilterPill({ c, label, onPress }: any) {
   );
 }
 
+function DiscoveryModeSwitch({ c, mode, onChange }: { c: any; mode: "map" | "list"; onChange: (mode: "map" | "list") => void }) {
+  return (
+    <View style={[styles.modeSwitch, { backgroundColor: c.surface2, borderColor: c.border }]}>
+      <ModeButton c={c} active={mode === "map"} icon="map" label="Map" onPress={() => onChange("map")} />
+      <ModeButton c={c} active={mode === "list"} icon="list" label="List" onPress={() => onChange("list")} />
+    </View>
+  );
+}
+
+function ModeButton({ c, active, icon, label, onPress }: any) {
+  return (
+    <Pressable onPress={onPress} style={[styles.modeButton, { backgroundColor: active ? c.inverse : "transparent" }]}>
+      <Ionicons name={icon} size={15} color={active ? c.onInverse : c.onSurface2} />
+      <Text style={{ color: active ? c.onInverse : c.onSurface2, fontWeight: "900", fontSize: 13 }}>{label}</Text>
+    </Pressable>
+  );
+}
+
 function NearbyMap({ c, items, onRefresh, onSelect }: any) {
+  const [mapFailed, setMapFailed] = useState(false);
   const centerLat = items.length ? items.reduce((sum: number, v: Vehicle) => sum + v.latitude, 0) / items.length : 19.076;
   const centerLng = items.length ? items.reduce((sum: number, v: Vehicle) => sum + v.longitude, 0) / items.length : 72.8777;
-  const region = {
-    latitude: centerLat,
-    longitude: centerLng,
-    latitudeDelta: 0.12,
-    longitudeDelta: 0.12,
-  };
+  const html = useMemo(() => mapLibreHtml(items.slice(0, 60), centerLat, centerLng), [items, centerLat, centerLng]);
   return (
     <View style={[styles.mapWrap, { backgroundColor: c.surface2, borderColor: c.border }]}>
       <View style={styles.mapHeader}>
         <View>
-          <Text style={{ color: c.onSurface, fontSize: 18, fontWeight: "900" }}>Nearby vehicles</Text>
-          <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 2 }}>Live availability around your pickup zone</Text>
+          <Text style={{ color: c.onSurface, fontSize: 18, fontWeight: "900" }}>MapLibre discovery</Text>
+          <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 2 }}>Free OpenStreetMap tiles with live vehicle markers</Text>
         </View>
         <Pressable testID="map-refresh" onPress={onRefresh} style={[styles.mapRefresh, { backgroundColor: c.surface }]}>
           <Ionicons name="refresh" size={18} color={c.onSurface} />
         </Pressable>
       </View>
-      {Platform.OS === "web" || (Platform.OS === "android" && !HAS_ANDROID_MAPS_KEY) ? (
+      {Platform.OS === "web" || mapFailed ? (
         <FallbackMap c={c} items={items} centerLat={centerLat} centerLng={centerLng} onSelect={onSelect} />
       ) : (
-        <MapView style={styles.mapCanvas} initialRegion={region} showsUserLocation showsMyLocationButton>
-          <Circle center={{ latitude: centerLat, longitude: centerLng }} radius={6000} strokeColor="rgba(5,196,107,0.45)" fillColor="rgba(5,196,107,0.08)" />
-          {items.slice(0, 60).map((item: Vehicle) => (
-            <Marker
-              key={item.vehicle_id}
-              coordinate={{ latitude: item.latitude, longitude: item.longitude }}
-              title={item.name}
-              description={`INR ${item.price_per_day}/day · ${item.rating.toFixed(1)} rating · ${item.distance_km} km`}
-              onCalloutPress={() => onSelect(item.vehicle_id)}
-            >
-              <View style={[styles.priceMarker, { backgroundColor: item.available === false ? c.surface3 : c.inverse }]}>
-                <Text style={{ color: item.available === false ? c.onSurface3 : c.onInverse, fontWeight: "900", fontSize: 11 }}>
-                  {item.type === "bike" ? "B" : "C"} · {Math.round(item.price_per_day / 1000)}k
-                </Text>
-              </View>
-            </Marker>
-          ))}
-        </MapView>
+        <WebView
+          testID="maplibre-webview"
+          originWhitelist={["*"]}
+          source={{ html }}
+          style={styles.mapCanvas}
+          javaScriptEnabled
+          domStorageEnabled
+          scrollEnabled={false}
+          onError={() => setMapFailed(true)}
+          onHttpError={() => setMapFailed(true)}
+          onMessage={(event) => {
+            const vehicleId = event.nativeEvent.data;
+            if (vehicleId === "__MAP_FAILED__") {
+              setMapFailed(true);
+              return;
+            }
+            if (vehicleId) onSelect(vehicleId);
+          }}
+        />
       )}
+    </View>
+  );
+}
+
+function mapLibreHtml(items: Vehicle[], centerLat: number, centerLng: number) {
+  const safeItems = JSON.stringify(items.map((item) => ({
+    id: item.vehicle_id,
+    type: item.type,
+    name: item.name,
+    price: item.price_per_day,
+    rating: item.rating,
+    distance: item.distance_km,
+    available: item.available !== false,
+    lat: Number(item.latitude),
+    lng: Number(item.longitude),
+  }))).replace(/</g, "\\u003c");
+
+  return `<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <style>
+    html, body, #map { height: 100%; margin: 0; overflow: hidden; background: #eef2f0; }
+    .marker {
+      border: 2px solid #fff;
+      border-radius: 999px;
+      box-shadow: 0 8px 20px rgba(0,0,0,.22);
+      color: #fff;
+      cursor: pointer;
+      font: 800 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      padding: 6px 8px;
+      white-space: nowrap;
+    }
+    .marker.available { background: #050505; }
+    .marker.unavailable { background: #777; }
+    .user-dot {
+      width: 18px;
+      height: 18px;
+      border-radius: 999px;
+      background: #05C46B;
+      border: 3px solid #fff;
+      box-shadow: 0 0 0 9px rgba(5,196,107,.18);
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script>
+    window.onerror = () => window.ReactNativeWebView?.postMessage("__MAP_FAILED__");
+    setTimeout(() => {
+      if (!window.maplibregl) window.ReactNativeWebView?.postMessage("__MAP_FAILED__");
+    }, 3500);
+    const vehicles = ${safeItems};
+    const center = [${Number(centerLng).toFixed(6)}, ${Number(centerLat).toFixed(6)}];
+    const map = new maplibregl.Map({
+      container: "map",
+      center,
+      zoom: 11,
+      attributionControl: false,
+      style: {
+        version: 8,
+        sources: {
+          osm: {
+            type: "raster",
+            tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+            tileSize: 256,
+            attribution: "OpenStreetMap"
+          }
+        },
+        layers: [{ id: "osm", type: "raster", source: "osm" }]
+      }
+    });
+    map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
+    const userDot = document.createElement("div");
+    userDot.className = "user-dot";
+    new maplibregl.Marker({ element: userDot }).setLngLat(center).addTo(map);
+    vehicles.forEach((vehicle) => {
+      if (!Number.isFinite(vehicle.lat) || !Number.isFinite(vehicle.lng)) return;
+      const el = document.createElement("button");
+      el.className = "marker " + (vehicle.available ? "available" : "unavailable");
+      el.textContent = (vehicle.type === "bike" ? "B" : "C") + " · " + Math.round(vehicle.price / 1000) + "k";
+      el.onclick = () => window.ReactNativeWebView?.postMessage(vehicle.id);
+      const popup = new maplibregl.Popup({ offset: 18 }).setHTML(
+        "<strong>" + vehicle.name + "</strong><br/>Rs " + vehicle.price + "/day · " + vehicle.rating.toFixed(1) + " rating · " + vehicle.distance + " km"
+      );
+      new maplibregl.Marker({ element: el }).setLngLat([vehicle.lng, vehicle.lat]).setPopup(popup).addTo(map);
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function NoMapDiscovery({ c, items, onRefresh }: any) {
+  const available = items.filter((item: Vehicle) => item.available !== false).length;
+  const nearest = items.length ? Math.min(...items.map((item: Vehicle) => Number(item.distance_km) || 999)) : 0;
+  const bestPrice = items.length ? Math.min(...items.map((item: Vehicle) => Number(item.price_per_day) || 999999)) : 0;
+
+  return (
+    <View style={[styles.noMapPanel, { backgroundColor: c.surface2, borderColor: c.border }]}>
+      <View style={styles.mapHeader}>
+        <View>
+          <Text style={{ color: c.onSurface, fontSize: 18, fontWeight: "900" }}>List-first discovery</Text>
+          <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 2 }}>No map needed. Compare nearby vehicles by distance, price, and trust.</Text>
+        </View>
+        <Pressable testID="list-refresh" onPress={onRefresh} style={[styles.mapRefresh, { backgroundColor: c.surface }]}>
+          <Ionicons name="refresh" size={18} color={c.onSurface} />
+        </Pressable>
+      </View>
+      <View style={styles.noMapStats}>
+        <StatTile c={c} icon="car-sport" label="Available" value={String(available)} />
+        <StatTile c={c} icon="navigate" label="Nearest" value={items.length ? `${nearest} km` : "-"} />
+        <StatTile c={c} icon="cash" label="From" value={items.length ? `Rs ${bestPrice.toLocaleString()}` : "-"} />
+      </View>
+    </View>
+  );
+}
+
+function StatTile({ c, icon, label, value }: any) {
+  return (
+    <View style={[styles.statTile, { backgroundColor: c.surface, borderColor: c.border }]}>
+      <Ionicons name={icon} size={18} color={c.accent} />
+      <Text style={{ color: c.onSurface, fontSize: 18, fontWeight: "900", marginTop: 6 }}>{value}</Text>
+      <Text style={{ color: c.onSurface3, fontSize: 11, fontWeight: "700", marginTop: 2 }}>{label}</Text>
     </View>
   );
 }
@@ -396,6 +541,8 @@ const styles = StyleSheet.create({
   filterPill: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 999, borderWidth: 1 },
   chip: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 999, borderWidth: 1, height: 36, flexShrink: 0 },
   pill: { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
+  modeSwitch: { flexDirection: "row", borderRadius: 16, borderWidth: 1, padding: 4 },
+  modeButton: { flex: 1, height: 40, borderRadius: 12, alignItems: "center", justifyContent: "center", flexDirection: "row", gap: 7 },
   mapWrap: { borderRadius: 22, borderWidth: 1, padding: 14 },
   mapHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 },
   mapCanvas: { height: 240, borderRadius: 18, overflow: "hidden", position: "relative" },
@@ -404,7 +551,9 @@ const styles = StyleSheet.create({
   mapRefresh: { width: 38, height: 38, borderRadius: 999, alignItems: "center", justifyContent: "center" },
   userDot: { position: "absolute", left: "48%", top: "48%", width: 16, height: 16, borderRadius: 999, borderWidth: 3, borderColor: "#fff" },
   marker: { position: "absolute", width: 34, height: 34, borderRadius: 999, alignItems: "center", justifyContent: "center", borderWidth: 2, borderColor: "#fff" },
-  priceMarker: { paddingHorizontal: 8, paddingVertical: 6, borderRadius: 999, borderWidth: 2, borderColor: "#fff" },
+  noMapPanel: { borderRadius: 22, borderWidth: 1, padding: 14 },
+  noMapStats: { flexDirection: "row", gap: 10 },
+  statTile: { flex: 1, minHeight: 92, borderRadius: 16, borderWidth: 1, padding: 12, justifyContent: "center" },
   pointsCard: { borderRadius: 24, padding: tokens.spacing.xl, overflow: "hidden" },
   pointsEyebrow: { color: "#fff", fontSize: 12, fontWeight: "700", letterSpacing: 2 },
   pointsTier: { color: "#fff", fontSize: 28, fontWeight: "900", marginTop: 4 },

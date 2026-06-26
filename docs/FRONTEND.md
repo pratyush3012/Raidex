@@ -73,6 +73,15 @@ EXPO_PUBLIC_BACKEND_URL=http://192.168.x.x:8000
 
 Search `RAIDEX_FRONTEND_API_CLIENT` for API calls, tokens, refresh flow, timeout handling, cache, and retry queue.
 
+## Maps
+
+Raidex does not require a paid Google Maps API key. Customer discovery supports:
+
+- Map mode: MapLibre GL JS inside `react-native-webview` with OpenStreetMap raster tiles.
+- List mode: no-map discovery with distance, price, availability, and trust signals.
+
+The app keeps a local fallback map if WebView tiles fail or the device is offline.
+
 ## Screens
 
 | Screen | Path |

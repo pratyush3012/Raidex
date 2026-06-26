@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import {
   View, Text, StyleSheet, Pressable, TextInput,
   ScrollView, KeyboardAvoidingView, Platform, ActivityIndicator,
@@ -17,17 +17,13 @@ const HERO = "https://images.unsplash.com/photo-1777329385816-4220415c266d?crop=
 export default function Landing() {
   const c = useTheme();
   const router = useRouter();
-  const { user, login, register, loginWithGoogle } = useAuth();
+  const { login, register, loginWithGoogle } = useAuth();
   const [mode, setMode] = useState<"intro" | "login" | "signup">("intro");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    if (user) router.replace("/(tabs)");
-  }, [user, router]);
 
   const submit = async () => {
     setError(null);
