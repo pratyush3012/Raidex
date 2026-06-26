@@ -1,0 +1,43 @@
+{
+  "ollama_host": "http://127.0.0.1:11434",
+  "hardware_profile": {
+    "minimum_ram_gb": 8,
+    "detected_ram_gb": null,
+    "gpu_required": false
+  },
+  "models": {
+    "primary_coding": {
+      "requested_family": "Qwen 3",
+      "preferred": "qwen3:1.7b",
+      "larger_optional": "qwen3:4b",
+      "too_large_for_16gb_ram": ["qwen3-coder:30b", "qwen3:32b"],
+      "purpose": "Primary local coding and code review model"
+    },
+    "reasoning": {
+      "requested_family": "DeepSeek R1",
+      "preferred": "deepseek-r1:8b",
+      "larger_optional": "deepseek-r1:8b",
+      "fallback": "deepseek-r1:1.5b",
+      "purpose": "Reasoning-heavy architecture and debugging analysis"
+    },
+    "general": {
+      "requested_family": "Llama 3.x Instruct",
+      "preferred": "llama3.2:3b",
+      "larger_optional": "llama3.2:3b",
+      "fallback": "llama3.2:1b",
+      "purpose": "General assistant, summaries, reports, and product analysis"
+    },
+    "lightweight": {
+      "requested_family": "Phi",
+      "preferred": "phi4-mini",
+      "larger_optional": "phi4-mini",
+      "fallback": "phi3:mini",
+      "purpose": "Fast fallback model for small tasks"
+    }
+  },
+  "pull_policy": {
+    "auto_pull": true,
+    "skip_large_models_without_gpu": true,
+    "confirm_before_models_over_gb": 8
+  }
+}

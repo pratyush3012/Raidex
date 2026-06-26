@@ -1,0 +1,84 @@
+{
+  "safe_development_rules": {
+    "may": [
+      "create issues",
+      "generate code",
+      "create branches",
+      "run tests",
+      "build locally",
+      "generate pull request drafts"
+    ],
+    "must_not": [
+      "push directly to main",
+      "deploy automatically",
+      "delete production data",
+      "modify production databases"
+    ],
+    "required_checks_before_review": [
+      "backend tests",
+      "frontend tests",
+      "typecheck",
+      "lint when configured",
+      "security scan",
+      "build verification"
+    ]
+  },
+  "agents": [
+    {
+      "id": "cto",
+      "name": "AI CTO",
+      "model_role": "general",
+      "write_access": false,
+      "duties": ["review project health", "set priorities", "generate daily engineering reports"]
+    },
+    {
+      "id": "architect",
+      "name": "AI Architect",
+      "model_role": "reasoning",
+      "write_access": false,
+      "duties": ["review architecture", "detect technical debt", "suggest refactoring"]
+    },
+    {
+      "id": "backend",
+      "name": "AI Backend Engineer",
+      "model_role": "primary_coding",
+      "write_access": true,
+      "duties": ["review backend", "find bugs", "suggest improvements"]
+    },
+    {
+      "id": "frontend",
+      "name": "AI Frontend Engineer",
+      "model_role": "primary_coding",
+      "write_access": true,
+      "duties": ["review UI/UX", "review accessibility", "review frontend performance"]
+    },
+    {
+      "id": "qa",
+      "name": "AI QA Engineer",
+      "model_role": "lightweight",
+      "write_access": false,
+      "duties": ["run tests", "generate bug reports", "watch test failures"]
+    },
+    {
+      "id": "security",
+      "name": "AI Security Engineer",
+      "model_role": "reasoning",
+      "write_access": false,
+      "duties": ["run dependency scans", "review secrets", "review authentication"]
+    },
+    {
+      "id": "devops",
+      "name": "AI DevOps Engineer",
+      "model_role": "general",
+      "write_access": false,
+      "duties": ["review CI/CD", "review deployments", "review build health"]
+    },
+    {
+      "id": "product",
+      "name": "AI Product Analyst",
+      "model_role": "general",
+      "write_access": false,
+      "duties": ["review analytics", "review user feedback", "suggest product improvements"]
+    }
+  ]
+}
