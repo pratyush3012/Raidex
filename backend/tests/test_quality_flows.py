@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import sys
@@ -52,6 +53,13 @@ class Collection:
         self.updated = []
 
     async def find_one(self, query, projection=None, *_, **__):
+        # A real await point (not just an `async def`) so that concurrent
+        # callers (e.g. via asyncio.gather) genuinely interleave between
+        # separate DB calls here, the way they would over a real network
+        # round-trip to MongoDB. This is what makes genuine concurrency tests
+        # against this fake meaningful instead of accidentally serialized by
+        # cooperative scheduling.
+        await asyncio.sleep(0)
         for doc in self.docs:
             if matches(doc, query):
                 if projection and all(v == 0 for v in projection.values()):
@@ -63,10 +71,12 @@ class Collection:
         return Cursor([dict(d) for d in self.docs if matches(d, query or {})])
 
     async def insert_one(self, doc, session=None):
+        await asyncio.sleep(0)
         self.inserted.append(doc)
         self.docs.append(doc)
 
     async def update_one(self, query, update, upsert=False, session=None):
+        await asyncio.sleep(0)
         self.updated.append((query, update, upsert))
         doc = next((item for item in self.docs if matches(item, query)), None)
         if doc is None and upsert:
@@ -77,6 +87,13 @@ class Collection:
         return None
 
     async def find_one_and_update(self, query, update, projection=None, return_document=False, session=None, **_kwargs):
+        # The await happens up front, before the match-and-mutate below runs
+        # to completion synchronously - this mirrors MongoDB's guarantee that
+        # findAndModify is atomic per document even though reaching the
+        # server has real latency: two concurrent callers can race to get
+        # here, but whichever one's check-and-set body runs first completes
+        # it entirely before the other's body can start.
+        await asyncio.sleep(0)
         for doc in self.docs:
             if matches(doc, query):
                 before = dict(doc)
@@ -148,6 +165,7 @@ class DB:
         self.client = FakeMongoClient()
         self.users = Collection([dict(USER)])
         self.vehicles = Collection()
+        self.vehicle_locks = Collection()
         self.bookings = Collection()
         self.payments = Collection()
         self.disputes = Collection()
@@ -192,6 +210,7 @@ class DB:
         self.payment_reconciliation_flags = Collection()
         self.fraud_flags = Collection()
         self.analytics_snapshots = Collection()
+        self.phone_otp_challenges = Collection()
 
     async def command(self, *_args, **_kwargs):
         return {"ok": 1}
@@ -244,6 +263,7 @@ def vehicle(**overrides):
         "host_name": "Host",
         "host_avatar": "https://avatar",
         "available": True,
+        "verification_status": "approved",
     }
     base.update(overrides)
     return base

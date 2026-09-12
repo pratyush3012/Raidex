@@ -285,7 +285,7 @@ def update_project_memory() -> Path:
         "ai_platform": "Local AI engineering OS under raidex-ai.",
     }
     memory["database_schema"] = {
-        "primary": "MongoDB in full backend; SQLite fallback server_sqlite.py for local verification.",
+        "primary": "MongoDB in full backend (backend/server.py). No SQLite fallback (removed - was dead code, never the production entrypoint).",
         "docs": "docs/DATABASE.md",
     }
     memory["api_contracts"] = {
@@ -303,7 +303,6 @@ def update_project_memory() -> Path:
     }
     memory["backend_services"] = {
         "entrypoint": "backend/server.py",
-        "local_sqlite": "backend/server_sqlite.py",
         "tests": "backend/tests",
     }
     memory["coding_conventions"] = {
@@ -425,7 +424,7 @@ def checks() -> dict:
         "frontend_tests": run(["npm.cmd", "test", "--", "--runInBand"], cwd=ROOT / "frontend", timeout=180),
         "frontend_typecheck": run(["npm.cmd", "run", "typecheck"], cwd=ROOT / "frontend", timeout=180),
         "frontend_audit": run(["npm.cmd", "audit", "--audit-level=moderate"], cwd=ROOT / "frontend", timeout=120),
-        "python_compile": run(["python", "-m", "py_compile", "backend/server.py", "backend/server_sqlite.py"], timeout=120),
+        "python_compile": run(["python", "-m", "py_compile", "backend/server.py"], timeout=120),
     }
 
 
@@ -438,7 +437,7 @@ def coverage_scan() -> dict:
 
 def smoke_scan() -> dict:
     return {
-        "backend_compile": run(["python", "-m", "py_compile", "backend/server.py", "backend/server_sqlite.py"], timeout=120),
+        "backend_compile": run(["python", "-m", "py_compile", "backend/server.py"], timeout=120),
         "git_status": run(["git", "status", "--short"], timeout=30),
         "github_status": run(["gh", "auth", "status"], timeout=30),
     }

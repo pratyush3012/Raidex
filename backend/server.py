@@ -31,7 +31,7 @@ except Exception:
 
 from providers import (
     get_payment_gateway, get_kyc_provider, get_damage_inspector, get_push_sender, get_ai_provider,
-    get_gps_provider,
+    get_gps_provider, get_sms_provider,
 )
 from providers.ai_provider import ChatTurn
 from providers.gps_provider import LocationEvent
@@ -67,12 +67,16 @@ def _validate_env() -> None:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
     if env_name in ("production", "prod", "staging"):
         origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
-        if not origins or any("localhost" in o or "127.0.0.1" in o for o in origins):
-            raise RuntimeError("Production ALLOWED_ORIGINS must be explicitly set to deployed app domains")
+        if not origins or any("localhost" in o or "127.0.0.1" in o or o == "*" for o in origins):
+            raise RuntimeError("Production ALLOWED_ORIGINS must be explicitly set to deployed app domains (no localhost, no wildcard '*')")
         if os.environ.get("PAYMENT_PROVIDER", "mock").lower() == "mock":
             raise RuntimeError("Production PAYMENT_PROVIDER cannot be mock")
+        if os.environ.get("PAYMENT_PROVIDER", "mock").lower() == "razorpay" and not os.environ.get("RAZORPAY_WEBHOOK_SECRET"):
+            raise RuntimeError("Production PAYMENT_PROVIDER=razorpay requires RAZORPAY_WEBHOOK_SECRET to be set")
         if os.environ.get("KYC_PROVIDER", "stub").lower() == "stub":
             raise RuntimeError("Production KYC_PROVIDER cannot be stub")
+        if os.environ.get("SMS_PROVIDER", "mock").lower() == "mock":
+            raise RuntimeError("Production SMS_PROVIDER cannot be mock — configure a real SMS provider")
 
 _validate_env()
 mongo_url = os.environ['MONGO_URL']
@@ -774,8 +778,17 @@ async def request_phone_otp(request: Request, payload: PhoneOtpRequest):
         "expires_at": expires_at.isoformat(),
         "ip": get_remote_address(request),
     })
+    sms_provider = get_sms_provider()
+    sms_result = await sms_provider.send_otp(phone, otp)
+    if not sms_result.sent:
+        logger.warning("SMS OTP delivery failed via %s: %s", sms_provider.name, sms_result.error)
+
     response = {"challenge_id": challenge_id, "expires_in": 300}
-    if os.getenv("SMS_PROVIDER", "mock").lower() == "mock":
+    env_name = os.environ.get("ENV", "development").lower()
+    # dev_otp is a local-dev convenience only: never include it once a real
+    # provider is configured, and never at all in production/staging
+    # (defense in depth even if SMS_PROVIDER were somehow left as mock there).
+    if sms_provider.is_mock and env_name not in ("production", "prod", "staging"):
         response["dev_otp"] = otp
     return response
 
@@ -1323,18 +1336,36 @@ async def payments_confirm(payment_id: str, payload: PaymentConfirmRequest, user
 
 @api_router.post("/payments/{payment_id}/refund")
 async def payments_refund(payment_id: str, user=Depends(get_current_user)):
-    p = await db.payments.find_one({"payment_id": payment_id, "user_id": user["user_id"]}, {"_id": 0})
+    # Atomically claim the refund so two concurrent refund requests for the same
+    # payment can't both pass the pre-check and both trigger a real gateway refund.
+    p = await db.payments.find_one_and_update(
+        {"payment_id": payment_id, "user_id": user["user_id"], "status": "succeeded",
+         "refund_status": {"$nin": ["processing", "processed"]}},
+        {"$set": {"refund_status": "processing", "updated_at": utc_now()}},
+        return_document=ReturnDocument.BEFORE,
+    )
     if not p:
-        raise HTTPException(status_code=404, detail="Payment not found")
-    if p["status"] != "succeeded":
-        raise HTTPException(status_code=400, detail="Only succeeded payments can be refunded")
-    if p["refund_status"] == "processed":
-        return p
+        existing = await db.payments.find_one({"payment_id": payment_id, "user_id": user["user_id"]}, {"_id": 0})
+        if not existing:
+            raise HTTPException(status_code=404, detail="Payment not found")
+        if existing["refund_status"] == "processing":
+            # Someone else is already refunding this payment right now.
+            for _ in range(10):
+                await asyncio.sleep(0.3)
+                existing = await db.payments.find_one({"payment_id": payment_id, "user_id": user["user_id"]}, {"_id": 0})
+                if existing["refund_status"] != "processing":
+                    break
+            return existing
+        if existing["refund_status"] == "processed":
+            return existing
+        if existing["status"] != "succeeded":
+            raise HTTPException(status_code=400, detail="Only succeeded payments can be refunded")
+        raise HTTPException(status_code=400, detail="Refund already in a terminal state")
 
     gateway = get_payment_gateway()
     res = await gateway.refund(provider_payment_id=p["provider_payment_id"], amount=p["amount"])
     if not res.success:
-        await db.payments.update_one({"payment_id": payment_id}, {"$set": {"refund_status": "failed"}})
+        await db.payments.update_one({"payment_id": payment_id}, {"$set": {"refund_status": "failed", "updated_at": utc_now()}})
         raise HTTPException(status_code=400, detail=res.failure_reason or "Refund failed")
     await db.payments.update_one({"payment_id": payment_id}, {"$set": {
         "refund_amount": res.refund_amount,
@@ -1346,7 +1377,13 @@ async def payments_refund(payment_id: str, user=Depends(get_current_user)):
     await _append_wallet_ledger(user["user_id"], res.refund_amount, "refund", payment_id=payment_id, ref_id=p.get("booking_id"))
     if p.get("booking_id"):
         await db.bookings.update_one({"booking_id": p["booking_id"]}, {"$set": {"status": "cancelled"}})
-    return await db.payments.find_one({"payment_id": payment_id}, {"_id": 0})
+    updated = await db.payments.find_one({"payment_id": payment_id}, {"_id": 0})
+    await NotificationService(db, get_push_sender()).notify(
+        user_id=user["user_id"], title="Refund processed",
+        body=f"Your refund of {res.refund_amount} has been processed.",
+        ntype="payment",
+    )
+    return updated
 
 
 @api_router.get("/payments/{payment_id}")
@@ -2164,8 +2201,13 @@ async def owner_update_vehicle(vehicle_id: str, body: dict, user=Depends(get_cur
     allowed = {k: v for k, v in body.items() if k in ("price_per_hour", "price_per_day", "price_per_week", "price_per_month", "available", "description", "deposit")}
     if not allowed:
         raise HTTPException(status_code=400, detail="No valid fields")
+    vehicle = await db.vehicles.find_one({"vehicle_id": vehicle_id, "owner_id": user["user_id"]}, {"_id": 0})
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    if allowed.get("available") is True and vehicle.get("verification_status") != "approved":
+        raise HTTPException(status_code=400, detail="Vehicle cannot be made available until admin approval (verification_status must be 'approved')")
     await db.vehicles.update_one({"vehicle_id": vehicle_id, "owner_id": user["user_id"]}, {"$set": allowed})
-    return await db.vehicles.find_one({"vehicle_id": vehicle_id}, {"_id": 0})
+    return await db.vehicles.find_one({"vehicle_id": vehicle_id, "owner_id": user["user_id"]}, {"_id": 0})
 
 
 @api_router.get("/owner/bookings")
@@ -3142,6 +3184,8 @@ async def create_indexes(target_db) -> None:
     await target_db.vehicles.create_index([("available", 1), ("type", 1), ("price_per_day", 1)])
     await target_db.vehicles.create_index([("distance_km", 1), ("rating", -1)])
     await target_db.bookings.create_index("booking_id", unique=True)
+    # Per-vehicle create-booking mutual-exclusion lock (see BookingService._acquire_vehicle_lock).
+    await target_db.vehicle_locks.create_index("vehicle_id", unique=True)
     await target_db.user_sessions.create_index("session_token", unique=True)
     await target_db.push_tokens.create_index([("user_id", 1), ("token", 1)], unique=True)
 

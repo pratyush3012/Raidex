@@ -28,6 +28,14 @@ services:
         sync: false
       - key: RAZORPAY_WEBHOOK_SECRET
         sync: false
+      - key: SMS_PROVIDER
+        value: msg91
+      - key: MSG91_API_KEY
+        sync: false          # paste from your MSG91 account (DLT sender/template registration required for India)
+      - key: MSG91_SENDER_ID
+        sync: false
+      - key: MSG91_TEMPLATE_ID
+        sync: false
       - key: PUSH_PROVIDER
         value: log
       - key: KYC_PROVIDER

@@ -12,6 +12,7 @@ from .damage_inspector import DamageInspector, get_damage_inspector
 from .push_sender import PushSender, get_push_sender
 from .ai_provider import AIProvider, get_ai_provider
 from .gps_provider import GPSProvider, get_gps_provider
+from .sms_provider import SMSProvider, get_sms_provider
 
 __all__ = [
     "PaymentGateway",
@@ -26,4 +27,6 @@ __all__ = [
     "get_ai_provider",
     "GPSProvider",
     "get_gps_provider",
+    "SMSProvider",
+    "get_sms_provider",
 ]

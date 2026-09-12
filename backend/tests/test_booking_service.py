@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -60,6 +61,45 @@ async def test_booking_service_create_rejects_invalid_ranges_and_conflicts(fake_
     with pytest.raises(HTTPException) as conflict:
         await service(fake_db).create_booking(booking_payload(), USER)
     assert conflict.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_booking_service_create_serializes_concurrent_overlapping_requests(fake_db):
+    """Two genuinely concurrent create_booking calls (run via asyncio.gather,
+    not sequentially) for overlapping date ranges on the SAME vehicle must
+    never both succeed. A MongoDB transaction around the conflict-check-then-
+    insert does NOT protect against this on its own: overlapping-but-distinct
+    bookings are separate documents, so Mongo's write-conflict detection has
+    nothing to catch - the fix is the per-vehicle lock in
+    BookingService._acquire_vehicle_lock. This test exercises real
+    interleaving (the fake DB's collection methods each contain a genuine
+    `await asyncio.sleep(0)`, simulating network latency) so it would catch a
+    regression back to relying on the transaction alone."""
+    fake_db.vehicles.docs.append(vehicle())
+    svc = service(fake_db)
+
+    async def attempt(start_date, end_date):
+        try:
+            booking = await svc.create_booking(
+                booking_payload(start_date=start_date, end_date=end_date), USER,
+            )
+            return ("ok", booking)
+        except HTTPException as exc:
+            return ("error", exc.status_code)
+
+    results = await asyncio.gather(
+        attempt("2026-07-01T00:00:00+00:00", "2026-07-03T00:00:00+00:00"),
+        attempt("2026-07-02T00:00:00+00:00", "2026-07-04T00:00:00+00:00"),
+    )
+
+    outcomes = [outcome for outcome, _ in results]
+    assert outcomes.count("ok") == 1, f"expected exactly one successful booking, got {results}"
+    assert outcomes.count("error") == 1, f"expected exactly one rejected request, got {results}"
+    rejected_status = next(status for outcome, status in results if outcome == "error")
+    assert rejected_status == 409
+
+    # No silent double-booking: only one booking document actually landed.
+    assert len(fake_db.bookings.docs) == 1
 
 
 @pytest.mark.asyncio

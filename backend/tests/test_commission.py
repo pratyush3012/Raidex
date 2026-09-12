@@ -60,7 +60,7 @@ async def test_historical_booking_commission_survives_later_config_change(fake_d
     fake_db.vehicles.docs.append({
         "vehicle_id": "veh_1", "type": "car", "name": "Nexon EV", "brand": "Tata",
         "image": "https://img", "location": "Delhi", "deposit": 5000,
-        "price_per_day": 1000, "available": True, "owner_id": "usr_owner_1",
+        "price_per_day": 1000, "available": True, "verification_status": "approved", "owner_id": "usr_owner_1",
     })
     payload = server.BookingCreate(
         vehicle_id="veh_1", plan="daily",

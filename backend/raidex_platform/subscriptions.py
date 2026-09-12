@@ -58,7 +58,7 @@ class SubscriptionService:
     async def create_subscription(self, *, user: dict, vehicle: dict, duration_months: int) -> dict:
         if user.get("kyc_status") != "verified":
             raise HTTPException(status_code=403, detail="KYC verification required before subscribing")
-        if not vehicle.get("available", False):
+        if not vehicle.get("available", False) or vehicle.get("verification_status") != "approved":
             raise HTTPException(status_code=409, detail="Vehicle is not available for subscription")
 
         q = await self.quote(vehicle, duration_months)

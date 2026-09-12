@@ -2,15 +2,23 @@
 # Search tags: booking create, booking cancel, booking extend, invoice, GST invoice,
 # disputes, availability conflict, booking lifecycle business rules.
 import os
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Callable, Optional
 
 from fastapi import HTTPException
-from pymongo.errors import OperationFailure
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError, OperationFailure
 
 
 class BookingService:
+    # How long a per-vehicle create-booking lock is held before it is treated
+    # as stale and reclaimable. Bounds how long a crashed/hung holder can
+    # block a vehicle - no manual cleanup is needed, the next request simply
+    # reclaims it once this window lapses.
+    VEHICLE_LOCK_TTL_SECONDS = 20
+
     def __init__(
         self,
         db: Any,
@@ -25,13 +33,70 @@ class BookingService:
         self._wallet_ledger_appender = wallet_ledger_appender
         self._commission_service = commission_service
 
+    async def _acquire_vehicle_lock(self, vehicle_id: str, holder: str) -> bool:
+        """Atomically claim a short-lived per-vehicle lock so two truly
+        concurrent create_booking calls for the same vehicle can never both
+        pass the conflict check and insert overlapping bookings.
+
+        A MongoDB transaction alone does NOT prevent this: two overlapping
+        (but not identical) bookings are two different documents, so there is
+        nothing for Mongo's write-conflict detection to catch. Serializing
+        booking *creation* per vehicle - via an atomic find_one_and_update
+        claim on a dedicated lock document, the same "atomic claim" pattern
+        used elsewhere in this codebase (see payment confirmation) - is what
+        actually makes the check-then-insert safe under real concurrency.
+        """
+        now = time.time()
+        available = {
+            "vehicle_id": vehicle_id,
+            "$or": [{"holder": None}, {"expires_at": {"$lt": now}}],
+        }
+        claim = {"$set": {
+            "vehicle_id": vehicle_id,
+            "holder": holder,
+            "expires_at": now + self.VEHICLE_LOCK_TTL_SECONDS,
+        }}
+
+        doc = await self.db.vehicle_locks.find_one_and_update(
+            available, claim, return_document=ReturnDocument.AFTER,
+        )
+        if doc is not None:
+            return True
+
+        # No lock row exists yet for this vehicle - create one lazily so the
+        # claim above has something to act on next time. If two requests race
+        # to create it, the unique index on vehicle_id lets only one insert
+        # win; the loser just falls through to the retry below.
+        try:
+            await self.db.vehicle_locks.update_one(
+                {"vehicle_id": vehicle_id},
+                {"$setOnInsert": {"vehicle_id": vehicle_id, "holder": None, "expires_at": 0}},
+                upsert=True,
+            )
+        except DuplicateKeyError:
+            pass
+
+        doc = await self.db.vehicle_locks.find_one_and_update(
+            available, claim, return_document=ReturnDocument.AFTER,
+        )
+        return doc is not None
+
+    async def _release_vehicle_lock(self, vehicle_id: str, holder: str) -> None:
+        # Only clears the lock if we're still the holder, so a slow request
+        # can never release a lock that has since expired and been reclaimed
+        # by someone else.
+        await self.db.vehicle_locks.update_one(
+            {"vehicle_id": vehicle_id, "holder": holder},
+            {"$set": {"holder": None, "expires_at": 0}},
+        )
+
     async def create_booking(self, payload: Any, user: dict) -> dict:
         if user.get("kyc_status") != "verified":
             raise HTTPException(status_code=403, detail="KYC verification required before booking")
         veh = await self.db.vehicles.find_one({"vehicle_id": payload.vehicle_id}, {"_id": 0})
         if not veh:
             raise HTTPException(status_code=404, detail="Vehicle not found")
-        if not veh.get("available", False):
+        if not veh.get("available", False) or veh.get("verification_status") != "approved":
             raise HTTPException(status_code=409, detail="Vehicle is not available for booking")
 
         start, end = self._parse_range(payload.start_date, payload.end_date)
@@ -95,19 +160,34 @@ class BookingService:
                 )
             await self.db.bookings.insert_one(booking, session=session)
 
-        # Run the conflict check + insert atomically inside a transaction so two
-        # concurrent requests for overlapping dates can't both pass the check and
-        # double-book the vehicle. Falls back to a best-effort non-atomic path on
-        # a standalone MongoDB (no replica set) that doesn't support transactions
-        # - this only happens in local/dev setups without a replica set.
+        # Serialize booking creation for this vehicle: only one concurrent
+        # create_booking call for the same vehicle may run the conflict check
+        # + insert at a time. This is what actually prevents double-booking
+        # under real concurrency - see _acquire_vehicle_lock for why the
+        # transaction below, on its own, is not enough.
+        lock_holder = uuid.uuid4().hex
+        if not await self._acquire_vehicle_lock(payload.vehicle_id, lock_holder):
+            raise HTTPException(
+                status_code=409,
+                detail="Vehicle is currently being booked by another request. Please try again.",
+            )
         try:
-            async with await self.db.client.start_session() as session:
-                async with session.start_transaction():
-                    await _check_conflict_and_insert(session)
-        except HTTPException:
-            raise
-        except OperationFailure:
-            await _check_conflict_and_insert(None)
+            # Also run the conflict check + insert inside a transaction, as
+            # defense in depth for write conflicts on a single document (e.g. a
+            # racing retry with the same booking id). Falls back to a
+            # best-effort non-atomic path on a standalone MongoDB (no replica
+            # set) that doesn't support transactions - this only happens in
+            # local/dev setups without a replica set.
+            try:
+                async with await self.db.client.start_session() as session:
+                    async with session.start_transaction():
+                        await _check_conflict_and_insert(session)
+            except HTTPException:
+                raise
+            except OperationFailure:
+                await _check_conflict_and_insert(None)
+        finally:
+            await self._release_vehicle_lock(payload.vehicle_id, lock_holder)
 
         booking.pop("_id", None)
         return booking
