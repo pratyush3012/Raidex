@@ -924,6 +924,7 @@ async def logout(payload: LogoutRequest = LogoutRequest(), authorization: Option
 
 
 @api_router.post("/auth/refresh", response_model=TokenResp)
+@limiter.limit("20/minute")
 async def refresh_token(payload: RefreshTokenRequest, request: Request):
     session = await db.device_sessions.find_one({"refresh_token": payload.refresh_token, "revoked": False}, {"_id": 0})
     if not session:
@@ -1164,11 +1165,12 @@ async def payments_create(payload: PaymentCreateRequest, user=Depends(get_curren
             raise HTTPException(status_code=404, detail="Booking not found")
         # Floor-check: the client can overpay (e.g. also covering the deposit
         # in one charge, as the checkout screen does) but must never be able
-        # to pay less than what the booking actually owes - the amount is
-        # otherwise fully client-supplied and was previously never checked
-        # against the booking record at all.
-        if payload.amount + 0.01 < booking["total_amount"]:
-            raise HTTPException(status_code=400, detail="Amount is less than the booking total")
+        # to pay less than what is actually owed for this payment's purpose -
+        # the amount is otherwise fully client-supplied. A "deposit" purpose
+        # owes the booking's deposit amount, not its full rental total.
+        floor = booking["deposit"] if payload.purpose == "deposit" else booking["total_amount"]
+        if payload.amount + 0.01 < floor:
+            raise HTTPException(status_code=400, detail="Amount is less than the amount owed")
 
     subscription = None
     if payload.subscription_id:
@@ -3003,6 +3005,12 @@ async def _run_agent(agent: str, system: str, payload: NexusChat, user: dict, sn
 
 @api_router.get("/nexus/threads/{thread_id}")
 async def nexus_thread(thread_id: str, user=Depends(get_current_user)):
+    thread = await db.support_threads.find_one({"thread_id": thread_id}, {"_id": 0})
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    is_admin = "admin" in (user.get("roles") or [user.get("role", "customer")]) or user.get("role") == "admin"
+    if thread.get("user_id") != user["user_id"] and not is_admin:
+        raise HTTPException(status_code=404, detail="Thread not found")
     msgs = await db.support_messages.find({"thread_id": thread_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
     return msgs
 
@@ -3208,6 +3216,14 @@ async def create_indexes(target_db) -> None:
 
     # KYC
     await target_db.kyc_submissions.create_index([("user_id", 1), ("submitted_at", -1)])
+    await target_db.kyc_submissions.create_index("kyc_id", unique=True)
+    await target_db.kyc_submissions.create_index("status")
+
+    # subscriptions / vehicle swaps — admin status-filter queries and owner listings
+    await target_db.subscriptions.create_index([("owner_id", 1), ("created_at", -1)])
+    await target_db.subscriptions.create_index("status")
+    await target_db.vehicle_swaps.create_index("status")
+    await target_db.service_benefits.create_index("vehicle_id")
 
     # inspections — critical for start/end trip prerequisite checks
     await target_db.inspections.create_index([("booking_id", 1), ("phase", 1)], unique=True)

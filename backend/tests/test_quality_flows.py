@@ -341,8 +341,7 @@ async def test_referral_rejects_self_referral(fake_db):
     assert exc.value.status_code == 400
 
 
-@pytest.mark.asyncio
-async def test_refresh_token_rejects_expired_session(fake_db):
+def test_refresh_token_rejects_expired_session(fake_db):
     fake_db.device_sessions.docs.append({
         "session_id": "ses_1",
         "refresh_token": "rft_expired",
@@ -350,9 +349,10 @@ async def test_refresh_token_rejects_expired_session(fake_db):
         "user_id": USER["user_id"],
         "expires_at": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
     })
-    with pytest.raises(HTTPException) as exc:
-        await server.refresh_token(server.RefreshTokenRequest(refresh_token="rft_expired"), request=type("Req", (), {"headers": {}})())
-    assert exc.value.status_code == 401
+    from fastapi.testclient import TestClient
+    client = TestClient(server.app, raise_server_exceptions=False)
+    res = client.post("/api/auth/refresh", json={"refresh_token": "rft_expired"})
+    assert res.status_code == 401
 
 
 @pytest.mark.asyncio
