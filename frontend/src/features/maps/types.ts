@@ -3,5 +3,5 @@ export type VehicleMapMarker = {
   latitude: number;
   longitude: number;
   price_per_day: number;
-  available: boolean;
+  available?: boolean;
 };

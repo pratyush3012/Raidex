@@ -3,8 +3,10 @@ import { View, Text, StyleSheet, Pressable, ActivityIndicator } from "react-nati
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
+import * as Haptics from "expo-haptics";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useTheme } from "@/src/theme";
+import Animated, { useSharedValue, useAnimatedStyle, withTiming, withSequence, withSpring, Easing } from "react-native-reanimated";
+import { useTheme, tokens } from "@/src/theme";
 import { api } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { RazorpayCheckout } from "@/src/components/RazorpayCheckout";
@@ -14,7 +16,7 @@ type Phase = "loading" | "checkout" | "processing" | "success" | "failure";
 const RAZORPAY_KEY = process.env.EXPO_PUBLIC_RAZORPAY_KEY_ID || "";
 
 export default function PayScreen() {
-  const { payment_id } = useLocalSearchParams<{ payment_id: string }>();
+  const { payment_id, method } = useLocalSearchParams<{ payment_id: string; method?: "card" | "upi" | "netbanking" }>();
   const c = useTheme();
   const router = useRouter();
   const { user, refresh } = useAuth();
@@ -23,8 +25,59 @@ export default function PayScreen() {
   const [progress, setProgress] = useState(0);
   const mockStarted = useRef(false);
 
+  // Signature-moment choreography: a scale+fade entrance on the success
+  // checkmark, a small shake on the failure cross, plus a haptic pulse fired
+  // exactly once per phase transition (guarded by the phase dependency array,
+  // not a ref, so it can't double-fire on unrelated re-renders).
+  const successScale = useSharedValue(0.5);
+  const successReveal = useSharedValue(0);
+  const failureShake = useSharedValue(0);
+  const failureReveal = useSharedValue(0);
+
+  useEffect(() => {
+    if (phase === "success") {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      successReveal.value = 0;
+      successReveal.value = withTiming(1, { duration: tokens.motion.slow, easing: Easing.out(Easing.cubic) });
+      successScale.value = 0.5;
+      successScale.value = withSequence(
+        withTiming(1.15, { duration: tokens.motion.quick, easing: Easing.out(Easing.quad) }),
+        withSpring(1, tokens.motion.springSnappy)
+      );
+    }
+  }, [phase]);
+
+  useEffect(() => {
+    if (phase === "failure") {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {});
+      failureReveal.value = 0;
+      failureReveal.value = withTiming(1, { duration: tokens.motion.slow, easing: Easing.out(Easing.cubic) });
+      failureShake.value = 0;
+      failureShake.value = withSequence(
+        withTiming(-8, { duration: 55 }),
+        withTiming(8, { duration: 55 }),
+        withTiming(-6, { duration: 55 }),
+        withTiming(6, { duration: 55 }),
+        withTiming(0, { duration: 55 })
+      );
+    }
+  }, [phase]);
+
+  const successIconStyle = useAnimatedStyle(() => ({ transform: [{ scale: successScale.value }] }));
+  const successContentStyle = useAnimatedStyle(() => ({
+    opacity: successReveal.value,
+    transform: [{ translateY: (1 - successReveal.value) * 12 }],
+  }));
+  const failureIconStyle = useAnimatedStyle(() => ({ transform: [{ translateX: failureShake.value }] }));
+  const failureContentStyle = useAnimatedStyle(() => ({
+    opacity: failureReveal.value,
+    transform: [{ translateY: (1 - failureReveal.value) * 12 }],
+  }));
+
   const providerLabel = payment?.provider === "razorpay" ? "Razorpay" : "Mock Gateway";
   const isWalletTopup = payment?.purpose === "wallet_topup";
+  const isSubscriptionRenewal = payment?.purpose === "subscription_renewal";
+  const isSubscription = payment?.purpose === "subscription" || (!!payment?.subscription_id && !isSubscriptionRenewal);
 
   const confirmPayment = useCallback(
     async (body: Record<string, string> = {}) => {
@@ -117,6 +170,7 @@ export default function PayScreen() {
           amountInr={payment.amount}
           name={user?.name || "Raidex User"}
           email={user?.email || ""}
+          method={method}
           onSuccess={async (result) => {
             try {
               await confirmPayment({
@@ -165,22 +219,30 @@ export default function PayScreen() {
         <LinearGradient colors={[c.accentBg, c.surface]} style={{ position: "absolute", left: 0, right: 0, top: 0, height: 360 }} />
         <SafeAreaView style={{ flex: 1, padding: 32 }}>
           <View style={{ flex: 1, alignItems: "center", justifyContent: "center" }}>
-            <View style={[styles.iconWrap, { backgroundColor: c.accent }]}>
+            <Animated.View style={[styles.iconWrap, { backgroundColor: c.accent }, successIconStyle]}>
               <Ionicons name="checkmark" size={56} color="#fff" />
-            </View>
-            <Text style={{ color: c.onSurface, fontSize: 28, fontWeight: "800", marginTop: 28 }}>Payment successful</Text>
-            <Text style={{ color: c.onSurface3, marginTop: 8, textAlign: "center" }}>
-              {isWalletTopup ? "Your wallet has been topped up." : "Your booking is confirmed."}
-            </Text>
-            <View style={[styles.receipt, { backgroundColor: c.surface2, borderColor: c.border }]}>
-              <ReceiptRow label="Amount paid" val={`₹${payment?.amount?.toLocaleString()}`} c={c} bold />
-              <ReceiptRow label="Payment ID" val={payment?.payment_id?.slice(0, 18) + "…"} c={c} />
-              <ReceiptRow label="Method" val={providerLabel} c={c} />
-              <ReceiptRow label="Status" val="Succeeded" c={c} accent />
-            </View>
+            </Animated.View>
+            <Animated.View style={[{ alignItems: "center" }, successContentStyle]}>
+              <Text style={{ color: c.onSurface, fontSize: 28, fontWeight: "800", marginTop: 28 }}>Payment successful</Text>
+              <Text style={{ color: c.onSurface3, marginTop: 8, textAlign: "center" }}>
+                {isWalletTopup ? "Your wallet has been topped up." : isSubscriptionRenewal ? "Your subscription has been renewed." : isSubscription ? "Your subscription is now active." : "Your booking is confirmed."}
+              </Text>
+              <View style={[styles.receipt, { backgroundColor: c.surface2, borderColor: c.border }]}>
+                <ReceiptRow label="Amount paid" val={`₹${payment?.amount?.toLocaleString()}`} c={c} bold />
+                <ReceiptRow label="Payment ID" val={payment?.payment_id?.slice(0, 18) + "…"} c={c} />
+                <ReceiptRow label="Method" val={providerLabel} c={c} />
+                <ReceiptRow label="Status" val="Succeeded" c={c} accent />
+              </View>
+            </Animated.View>
           </View>
-          <Pressable testID="view-trip-btn" onPress={() => router.replace(isWalletTopup ? "/(tabs)/profile" : "/(tabs)/trips" as any)} style={[styles.cta, { backgroundColor: c.inverse }]}>
-            <Text style={{ color: c.onInverse, fontWeight: "800", fontSize: 16 }}>{isWalletTopup ? "Back to profile" : "View my trip"}</Text>
+          <Pressable
+            testID="view-trip-btn"
+            onPress={() => router.replace((isWalletTopup ? "/(tabs)/profile" : (isSubscription || isSubscriptionRenewal) ? "/subscriptions" : "/(tabs)/trips") as any)}
+            style={[styles.cta, { backgroundColor: c.inverse }]}
+          >
+            <Text style={{ color: c.onInverse, fontWeight: "800", fontSize: 16 }}>
+              {isWalletTopup ? "Back to profile" : (isSubscription || isSubscriptionRenewal) ? "View my subscription" : "View my trip"}
+            </Text>
             <Ionicons name="arrow-forward" size={18} color={c.onInverse} />
           </Pressable>
         </SafeAreaView>
@@ -192,15 +254,17 @@ export default function PayScreen() {
     <View style={{ flex: 1, backgroundColor: c.surface }}>
       <SafeAreaView style={{ flex: 1, padding: 32 }}>
         <View style={{ flex: 1, alignItems: "center", justifyContent: "center" }}>
-          <View style={[styles.iconWrap, { backgroundColor: c.error }]}>
+          <Animated.View style={[styles.iconWrap, { backgroundColor: c.error }, failureIconStyle]}>
             <Ionicons name="close" size={56} color="#fff" />
-          </View>
-          <Text style={{ color: c.onSurface, fontSize: 26, fontWeight: "800", marginTop: 28 }}>Payment failed</Text>
-          <Text style={{ color: c.onSurface3, marginTop: 8, textAlign: "center" }}>{payment?.failure_reason || "Something went wrong."}</Text>
-          <View style={[styles.receipt, { backgroundColor: c.surface2, borderColor: c.border }]}>
-            <ReceiptRow label="Amount" val={`₹${payment?.amount?.toLocaleString()}`} c={c} />
-            <ReceiptRow label="Status" val="Failed" c={c} danger />
-          </View>
+          </Animated.View>
+          <Animated.View style={[{ alignItems: "center" }, failureContentStyle]}>
+            <Text style={{ color: c.onSurface, fontSize: 26, fontWeight: "800", marginTop: 28 }}>Payment failed</Text>
+            <Text style={{ color: c.onSurface3, marginTop: 8, textAlign: "center" }}>{payment?.failure_reason || "Something went wrong."}</Text>
+            <View style={[styles.receipt, { backgroundColor: c.surface2, borderColor: c.border }]}>
+              <ReceiptRow label="Amount" val={`₹${payment?.amount?.toLocaleString()}`} c={c} />
+              <ReceiptRow label="Status" val="Failed" c={c} danger />
+            </View>
+          </Animated.View>
         </View>
         <Pressable
           testID="retry-btn"

@@ -12,7 +12,7 @@ appId: in.raidex.app
 - inputText: "Test1234!"
 - tapOn:
     id: "auth-submit-btn"
-- assertVisible: "Nearby vehicles"
+- assertVisible: "Nearby rides"
 - tapOn: "Profile"
 - tapOn:
     id: "owner-row"

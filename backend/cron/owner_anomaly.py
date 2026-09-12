@@ -28,6 +28,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 
+import sys as _sys
+_BACKEND_ROOT = Path(__file__).parent.parent
+if str(_BACKEND_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_BACKEND_ROOT))
+
+from providers.ai_provider import get_ai_provider, ChatTurn  # noqa: E402
+
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 logger = logging.getLogger("raidex.cron.owner_anomaly")
@@ -35,8 +42,6 @@ logging.basicConfig(level=logging.INFO)
 
 MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ["DB_NAME"]
-EMERGENT_LLM_KEY = os.getenv("EMERGENT_LLM_KEY", "")
-LLM_MODEL = ("anthropic", "claude-sonnet-4-6")
 
 OWNER_ANOMALY_SYSTEM = """You are Raidex Fleet Intelligence, an AI analyst watching over vehicle owners' performance.
 Your job: given a snapshot of an owner's last 7 days, identify the 1–3 most actionable anomalies.
@@ -124,8 +129,13 @@ async def _owner_snapshot(db, owner_id: str, owner_name: str) -> dict:
 
 async def _run_anomaly_check(db, owner_id: str, owner_name: str) -> str | None:
     """Return a push notification body string, or None if no anomaly."""
-    if not EMERGENT_LLM_KEY:
-        logger.warning("EMERGENT_LLM_KEY not set — skipping AI anomaly check")
+    provider = get_ai_provider()
+    if provider.name == "stub":
+        # No real AI provider configured. Do NOT fabricate anomalies or spam
+        # owners with a placeholder message - record the skip so it's visible
+        # in /admin/nexus/health and job-run diagnostics instead of silently
+        # no-oping (the old emergentintegrations ImportError behavior).
+        logger.warning("AI provider not configured (stub) — skipping owner anomaly check for %s", owner_id)
         return None
 
     snap = await _owner_snapshot(db, owner_id, owner_name)
@@ -141,36 +151,38 @@ async def _run_anomaly_check(db, owner_id: str, owner_name: str) -> str | None:
     )
 
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        reply = await provider.chat(system=OWNER_ANOMALY_SYSTEM, history=[], message=prompt)
+        reply = (reply or "").strip()
 
-        session_id = f"anomaly_{owner_id}_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=session_id,
-            system_message=OWNER_ANOMALY_SYSTEM,
-        ).with_model(*LLM_MODEL)
-
-        resp = await chat.send_message(UserMessage(text=prompt))
-        reply = (resp.text or "").strip()
-
-        if reply.startswith("NO_ANOMALY") or not reply:
-            return None
-
-        # Store run for audit / ops visibility
+        # Store run for audit / ops visibility regardless of outcome
         await db.agent_runs.insert_one({
             "run_id": "run_" + uuid.uuid4().hex[:10],
             "agent": "owner_anomaly_cron",
             "owner_id": owner_id,
             "input": prompt[:500],
-            "output": reply[:500],
-            "model": f"{LLM_MODEL[0]}/{LLM_MODEL[1]}",
+            "output": reply[:500] if reply else None,
+            "model": provider.name,
+            "error": None,
             "created_at": utc_now(),
         })
+
+        if reply.startswith("NO_ANOMALY") or not reply:
+            return None
 
         return reply
 
     except Exception as exc:
-        logger.exception("LLM anomaly check failed for owner %s: %s", owner_id, exc)
+        logger.exception("AI anomaly check failed for owner %s: %s", owner_id, exc)
+        await db.agent_runs.insert_one({
+            "run_id": "run_" + uuid.uuid4().hex[:10],
+            "agent": "owner_anomaly_cron",
+            "owner_id": owner_id,
+            "input": prompt[:500],
+            "output": None,
+            "model": provider.name,
+            "error": str(exc),
+            "created_at": utc_now(),
+        })
         return None
 
 

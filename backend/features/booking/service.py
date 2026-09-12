@@ -4,15 +4,26 @@
 import os
 import uuid
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from fastapi import HTTPException
+from pymongo.errors import OperationFailure
 
 
 class BookingService:
-    def __init__(self, db: Any, utc_now: Callable[[], str]):
+    def __init__(
+        self,
+        db: Any,
+        utc_now: Callable[[], str],
+        payment_gateway_factory: Optional[Callable[[], Any]] = None,
+        wallet_ledger_appender: Optional[Callable[..., Any]] = None,
+        commission_service: Optional[Any] = None,
+    ):
         self.db = db
         self.utc_now = utc_now
+        self._payment_gateway_factory = payment_gateway_factory
+        self._wallet_ledger_appender = wallet_ledger_appender
+        self._commission_service = commission_service
 
     async def create_booking(self, payload: Any, user: dict) -> dict:
         if user.get("kyc_status") != "verified":
@@ -28,24 +39,23 @@ class BookingService:
         if duration <= 0:
             raise HTTPException(status_code=400, detail="End date must be after start date")
 
-        conflict = await self.db.bookings.find_one({
-            "vehicle_id": payload.vehicle_id,
-            "status": {"$in": ["confirmed", "active"]},
-            "start_date": {"$lt": payload.end_date},
-            "end_date": {"$gt": payload.start_date},
-        }, {"_id": 0, "booking_id": 1, "start_date": 1, "end_date": 1})
-        if conflict:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Vehicle is already booked from {conflict['start_date']} to {conflict['end_date']}. Please choose different dates.",
+        amount = self._rental_amount(veh, payload.plan, duration)
+        owner_id = veh.get("owner_id", "usr_marketplace")
+
+        # Snapshot the commission split at booking-creation time. This is a durable
+        # financial record: if the platform commission config changes later, this
+        # booking's own figures must NOT retroactively change.
+        commission_split = {"commission_rate": 0.0, "commission_amount": 0.0, "net_amount": amount}
+        if self._commission_service is not None:
+            commission_split = await self._commission_service.calculate(
+                amount, vehicle_category=veh.get("type"), owner_id=owner_id,
             )
 
-        amount = self._rental_amount(veh, payload.plan, duration)
         booking = {
             "booking_id": "bkg_" + uuid.uuid4().hex[:12],
             "user_id": user["user_id"],
             "vehicle_id": veh["vehicle_id"],
-            "owner_id": veh.get("owner_id", "usr_marketplace"),
+            "owner_id": owner_id,
             "vehicle_snapshot": {
                 "name": veh["name"],
                 "image": veh["image"],
@@ -58,6 +68,9 @@ class BookingService:
             "end_date": payload.end_date,
             "total_amount": amount,
             "deposit": veh["deposit"],
+            "commission_rate": commission_split["commission_rate"],
+            "commission_amount": commission_split["commission_amount"],
+            "owner_net_amount": commission_split["net_amount"],
             "status": "pending_payment",
             "created_at": self.utc_now(),
             "odometer_start": None,
@@ -67,7 +80,35 @@ class BookingService:
             "add_ons": payload.add_ons,
             "payment_id": None,
         }
-        await self.db.bookings.insert_one(booking)
+
+        async def _check_conflict_and_insert(session=None) -> None:
+            conflict = await self.db.bookings.find_one({
+                "vehicle_id": payload.vehicle_id,
+                "status": {"$in": ["confirmed", "active"]},
+                "start_date": {"$lt": payload.end_date},
+                "end_date": {"$gt": payload.start_date},
+            }, {"_id": 0, "booking_id": 1, "start_date": 1, "end_date": 1}, session=session)
+            if conflict:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Vehicle is already booked from {conflict['start_date']} to {conflict['end_date']}. Please choose different dates.",
+                )
+            await self.db.bookings.insert_one(booking, session=session)
+
+        # Run the conflict check + insert atomically inside a transaction so two
+        # concurrent requests for overlapping dates can't both pass the check and
+        # double-book the vehicle. Falls back to a best-effort non-atomic path on
+        # a standalone MongoDB (no replica set) that doesn't support transactions
+        # - this only happens in local/dev setups without a replica set.
+        try:
+            async with await self.db.client.start_session() as session:
+                async with session.start_transaction():
+                    await _check_conflict_and_insert(session)
+        except HTTPException:
+            raise
+        except OperationFailure:
+            await _check_conflict_and_insert(None)
+
         booking.pop("_id", None)
         return booking
 
@@ -79,16 +120,40 @@ class BookingService:
             raise HTTPException(status_code=422, detail=f"Cannot cancel a {booking['status']} booking")
 
         refund_due = 0
+        refund_status = None
+        pay = None
         if booking.get("payment_id"):
             pay = await self.db.payments.find_one({"payment_id": booking["payment_id"], "status": "succeeded"}, {"_id": 0})
             if pay:
                 refund_due = pay["amount"]
+
+        if pay and self._payment_gateway_factory and self._wallet_ledger_appender:
+            gateway = self._payment_gateway_factory()
+            result = await gateway.refund(provider_payment_id=pay.get("provider_payment_id"), amount=pay["amount"])
+            if result.success:
+                await self.db.payments.update_one({"payment_id": pay["payment_id"]}, {"$set": {
+                    "refund_amount": result.refund_amount,
+                    "refund_status": "processed",
+                    "status": "refunded",
+                    "refunded_at": self.utc_now(),
+                    "updated_at": self.utc_now(),
+                }})
+                await self._wallet_ledger_appender(
+                    user["user_id"], result.refund_amount, "refund",
+                    payment_id=pay["payment_id"], ref_id=booking_id,
+                )
+                refund_due = result.refund_amount
+                refund_status = "processed"
+            else:
+                await self.db.payments.update_one({"payment_id": pay["payment_id"]}, {"$set": {"refund_status": "failed"}})
+                refund_status = "failed"
 
         await self.db.bookings.update_one({"booking_id": booking_id}, {"$set": {
             "status": "cancelled",
             "cancel_reason": payload.reason.strip(),
             "cancelled_at": self.utc_now(),
             "refund_due": refund_due,
+            "refund_status": refund_status,
         }})
         await self.db.admin_audit.insert_one({
             "audit_id": "aud_" + uuid.uuid4().hex[:10],
@@ -100,7 +165,7 @@ class BookingService:
             "after_state": {"status": "cancelled", "refund_due": refund_due},
             "created_at": self.utc_now(),
         })
-        return {"ok": True, "status": "cancelled", "refund_due": refund_due}
+        return {"ok": True, "status": "cancelled", "refund_due": refund_due, "refund_status": refund_status}
 
     async def extend_booking(self, booking_id: str, payload: Any, user: dict) -> dict:
         booking = await self.db.bookings.find_one({"booking_id": booking_id, "user_id": user["user_id"]}, {"_id": 0})

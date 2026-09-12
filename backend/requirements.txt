@@ -1,8 +1,5 @@
 fastapi==0.138.0
 uvicorn==0.25.0
-boto3>=1.34.129
-requests-oauthlib>=2.0.0
-cryptography>=42.0.8
 python-dotenv>=1.0.1
 pymongo==4.6.3
 pydantic>=2.6.4
@@ -19,14 +16,14 @@ black>=24.1.1
 isort>=5.13.2
 flake8>=7.0.0
 mypy>=1.8.0
-python-jose>=3.3.0
 requests>=2.31.0
-pandas>=2.2.0
-numpy>=1.26.0
 python-multipart>=0.0.9
-jq>=1.6.0
-typer>=0.9.0
 httpx>=0.27.0
 apscheduler>=3.10.4
 slowapi>=0.1.9
 sentry-sdk>=2.13.0
+anthropic>=0.39.0
+
+# Removed as unused (not imported anywhere in backend/): boto3, requests-oauthlib,
+# cryptography, python-jose, pandas, numpy, jq, typer. requests is kept - it's
+# used by tests/backend_test.py (the opt-in live API smoke test).

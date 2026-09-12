@@ -202,8 +202,8 @@ export default function Landing() {
               </View>
 
               <View style={styles.providerGrid}>
-                <ProviderButton c={c} icon="logo-google" label="Google" testID="google-signin-btn" onPress={() => provider("google")} />
-                <ProviderButton c={c} icon="logo-apple" label="Apple" testID="apple-signin-btn" onPress={() => provider("apple")} />
+                <ProviderButton c={c} icon="logo-google" label="Google" testID="google-signin-btn" onPress={() => provider("google")} disabled />
+                <ProviderButton c={c} icon="logo-apple" label="Apple" testID="apple-signin-btn" onPress={() => provider("apple")} disabled />
               </View>
             </View>
           </View>
@@ -243,11 +243,16 @@ function Field({ c, label, icon, ...props }: any) {
   );
 }
 
-function ProviderButton({ c, icon, label, onPress, testID }: any) {
+function ProviderButton({ c, icon, label, onPress, testID, disabled }: any) {
   return (
-    <Pressable testID={testID} onPress={onPress} style={({ pressed }) => [styles.providerBtn, { backgroundColor: c.surface, borderColor: c.border, opacity: pressed ? 0.86 : 1 }]}>
+    <Pressable
+      testID={testID}
+      onPress={disabled ? undefined : onPress}
+      disabled={disabled}
+      style={({ pressed }) => [styles.providerBtn, { backgroundColor: c.surface, borderColor: c.border, opacity: disabled ? 0.5 : pressed ? 0.86 : 1 }]}
+    >
       <Ionicons name={icon} size={20} color={c.onSurface} />
-      <Text style={{ color: c.onSurface, fontWeight: "900" }}>{label}</Text>
+      <Text style={{ color: c.onSurface, fontWeight: "900" }}>{disabled ? `${label} · Coming soon` : label}</Text>
     </Pressable>
   );
 }

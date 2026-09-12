@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
-import { api, saveToken, saveRefreshToken, clearToken, getToken } from "../api/client";
+import { api, saveToken, saveRefreshToken, clearToken, getToken, getRefreshToken } from "../api/client";
 import * as Notifications from "expo-notifications";
 import Constants from "expo-constants";
 import { Platform } from "react-native";
@@ -187,7 +187,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const logout = useCallback(async () => {
     await unregisterPushToken();
     try {
-      await api("/auth/logout", { method: "POST" });
+      const refresh_token = await getRefreshToken();
+      await api("/auth/logout", { method: "POST", body: { refresh_token } });
     } catch {}
     await clearToken();
     setUser(null);

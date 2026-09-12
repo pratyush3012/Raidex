@@ -8,6 +8,7 @@ services:
     pythonVersion: "3.12.0"
     buildCommand: pip install -r requirements-deploy.txt
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
     envVars:
       - key: ENV
         value: production
@@ -17,13 +18,27 @@ services:
         sync: false          # you paste this from Atlas after setup
       - key: DB_NAME
         value: raidex
+      - key: ADMIN_PASSWORD
+        sync: false          # required in production - server refuses to boot without it
       - key: PAYMENT_PROVIDER
-        value: mock
+        value: razorpay
+      - key: RAZORPAY_KEY_ID
+        sync: false          # paste from your Razorpay dashboard
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
       - key: PUSH_PROVIDER
         value: log
       - key: KYC_PROVIDER
-        value: stub
+        value: karza
+      - key: KARZA_API_KEY
+        sync: false          # paste from your Karza account (switch KYC_PROVIDER to idfy + set IDFY_* vars to use IDfy instead)
       - key: DAMAGE_AI_PROVIDER
         value: stub
+      - key: AI_PROVIDER
+        value: anthropic
+      - key: ANTHROPIC_API_KEY
+        sync: false          # paste from https://console.anthropic.com - Nexus falls back to a safe non-AI stub if unset
       - key: ALLOWED_ORIGINS
-        value: "*"
+        sync: false          # set to your real frontend origin(s), comma-separated - never "*" in production

@@ -5,7 +5,8 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header, Request, WebSocket, WebSocketDisconnect, status
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
+from pymongo import ReturnDocument
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -29,10 +30,19 @@ except Exception:
     SentryAsgiMiddleware = None
 
 from providers import (
-    get_payment_gateway, get_kyc_provider, get_damage_inspector, get_push_sender,
+    get_payment_gateway, get_kyc_provider, get_damage_inspector, get_push_sender, get_ai_provider,
+    get_gps_provider,
 )
+from providers.ai_provider import ChatTurn
+from providers.gps_provider import LocationEvent
 from features.booking import BookingService
 from raidex_platform.analytics import AnalyticsEngine
+from raidex_platform.commission import CommissionService
+from raidex_platform.payouts import PayoutService
+from raidex_platform.reconciliation import LedgerReconciliationService
+from raidex_platform.service_milestones import ServiceMilestoneService
+from raidex_platform.subscriptions import SubscriptionService
+from raidex_platform.vehicle_swap import VehicleSwapService
 from raidex_platform.audit import AuditLogger
 from raidex_platform.events import DomainEvent, EventBus
 from raidex_platform.feature_flags import FeatureFlagService
@@ -40,6 +50,8 @@ from raidex_platform.jobs import JobRunner, default_job_registry
 from raidex_platform.notifications import NotificationService
 from raidex_platform.observability import ObservabilityMetrics
 from raidex_platform.pricing import DynamicPricingEngine
+from raidex_platform.rate_limits import rate_limit_for_role, parse_rate_limit
+from raidex_platform.rate_limiter import get_rate_limiter
 from raidex_platform.recommendations import RecommendationEngine
 from providers.kyc_provider import KYCSubmission
 from providers.push_sender import PushPayload
@@ -66,6 +78,9 @@ _validate_env()
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
+# GridFS bucket for KYC document images - keeps large base64 blobs out of the
+# kyc_submissions documents themselves (only file id references are stored there).
+fs_bucket = AsyncIOMotorGridFSBucket(db, bucket_name="kyc_documents")
 
 # ── JWT_SECRET must be explicitly set in production ───────────────────────────
 _jwt_secret_env = os.environ.get("JWT_SECRET", "")
@@ -94,8 +109,20 @@ def _hash_password(password: str) -> str:
 def _verify_password(password: str, hashed: str) -> bool:
     return _bcrypt_lib.checkpw(password.encode(), hashed.encode())
 
-# ── Rate limiter (auth endpoints) ─────────────────────────────────────────────
+# ── Rate limiter (auth endpoints, via slowapi + TestClient) ──────────────────
 limiter = Limiter(key_func=get_remote_address)
+
+
+def check_rate_limit(action: str, user: dict) -> None:
+    """Enforce the same role-based ceilings (raidex_platform.rate_limits) on
+    sensitive, state-changing endpoints beyond just auth - booking, payment,
+    KYC, wallet, AI Nexus, and admin financial actions. Raises 429 when the
+    calling user has exceeded their role's limit for this action."""
+    role = user.get("role") or "customer"
+    limit, window = parse_rate_limit(rate_limit_for_role(role))
+    key = f"{action}:{user.get('user_id', 'anon')}"
+    if not get_rate_limiter().hit(key, limit, window):
+        raise HTTPException(status_code=429, detail="Too many requests. Please slow down and try again shortly.")
 
 app = FastAPI(title="Raidex API")
 app.state.limiter = limiter
@@ -196,6 +223,12 @@ for _event_name in (
     event_bus.subscribe(_event_name, _analytics_event_subscriber)
     event_bus.subscribe(_event_name, _notification_event_subscriber)
 
+# Analytics-only (not double-subscribed to _notification_event_subscriber -
+# these endpoints already send a direct, more specific notification themselves;
+# subscribing here too would double-notify the user).
+for _event_name in ("PayoutCreated", "SubscriptionCreated", "VehicleSwapRequested"):
+    event_bus.subscribe(_event_name, _analytics_event_subscriber)
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     request_id = request.headers.get("x-request-id") or ("req_" + uuid.uuid4().hex[:12])
@@ -259,6 +292,9 @@ class GoogleSessionRequest(BaseModel):
 
 class RefreshTokenRequest(BaseModel):
     refresh_token: str
+
+class LogoutRequest(BaseModel):
+    refresh_token: Optional[str] = None
 
 class User(BaseModel):
     user_id: str
@@ -551,8 +587,18 @@ async def seed_data():
         # Admin account: generate a strong random password on first run
         # Set ADMIN_EMAIL and ADMIN_PASSWORD env vars to customize
         import secrets
+        env_name = os.environ.get("ENV", "development").lower()
         admin_email = os.environ.get("ADMIN_EMAIL", "admin@raidex.io")
-        admin_password = os.environ.get("ADMIN_PASSWORD", secrets.token_urlsafe(32))
+        admin_password_env = os.environ.get("ADMIN_PASSWORD")
+        if env_name in ("production", "staging") and not admin_password_env:
+            # Never auto-generate + log a real admin password in production - a generated
+            # password logged via logger.warning can leak into log aggregators/Sentry
+            # breadcrumbs. Require the operator to set it explicitly instead.
+            raise RuntimeError(
+                "ADMIN_PASSWORD must be set explicitly when ENV=production/staging "
+                "(no auto-generated admin password is created or logged in these environments)."
+            )
+        admin_password = admin_password_env or secrets.token_urlsafe(32)
         admin_password = admin_password[:72]  # bcrypt max is 72 bytes
         await db.users.insert_one({
             "user_id": "usr_admin0001", "email": admin_email,
@@ -562,12 +608,16 @@ async def seed_data():
             "wallet_balance": 0, "ride_miles": 0, "tier": "Platinum",
             "created_at": utc_now(),
         })
-        logger.warning(
-            f"Admin account created: {admin_email}\n"
-            f"Password: {admin_password}\n"
-            "Save this password — it will not be shown again. "
-            "Set ADMIN_PASSWORD env var before next restart to customize."
-        )
+        if not admin_password_env:
+            # Dev/local convenience only (never reached in production/staging, see above).
+            logger.warning(
+                f"Admin account created: {admin_email}\n"
+                f"Password: {admin_password}\n"
+                "Save this password — it will not be shown again. "
+                "Set ADMIN_PASSWORD env var before next restart to customize."
+            )
+        else:
+            logger.info(f"Admin account created: {admin_email} (password set via ADMIN_PASSWORD env var)")
 
 
 # ============================================================
@@ -835,20 +885,28 @@ async def me(user=Depends(get_current_user)):
 
 
 @api_router.post("/auth/logout")
-async def logout(authorization: Optional[str] = Header(None)):
+async def logout(payload: LogoutRequest = LogoutRequest(), authorization: Optional[str] = Header(None)):
     if authorization and authorization.startswith("Bearer "):
         token = authorization.split(" ", 1)[1].strip()
         try:
-            payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-            if payload.get("jti"):
+            decoded = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+            if decoded.get("jti"):
                 await db.revoked_tokens.update_one(
-                    {"jti": payload["jti"]},
-                    {"$set": {"jti": payload["jti"], "user_id": payload.get("uid"), "revoked_at": utc_now()}},
+                    {"jti": decoded["jti"]},
+                    {"$set": {"jti": decoded["jti"], "user_id": decoded.get("uid"), "revoked_at": utc_now()}},
                     upsert=True,
                 )
         except pyjwt.PyJWTError:
             pass
         await db.user_sessions.delete_one({"session_token": token})
+    if payload.refresh_token:
+        # Also revoke the refresh token's device session, otherwise a "logged out"
+        # refresh token stays valid for up to REFRESH_EXPIRE_DAYS and can keep
+        # minting new access tokens via /auth/refresh.
+        await db.device_sessions.update_one(
+            {"refresh_token": payload.refresh_token},
+            {"$set": {"revoked": True, "revoked_at": utc_now()}},
+        )
     return {"ok": True}
 
 
@@ -886,15 +944,26 @@ async def revoke_session(session_id: str, user=Depends(get_current_user)):
 # ============================================================
 # KYC (Slice 2)
 # ============================================================
+# Base64 data-URI images can legitimately run several MB; cap well above a
+# real phone photo (~6MB binary ≈ 8M base64 chars) rather than at a token URL length.
+KYC_IMAGE_MAX_LENGTH = 8_000_000
+
+
 class KYCSubmitRequest(BaseModel):
-    aadhaar_front: str = Field(min_length=3, max_length=2000)
-    aadhaar_back: str = Field(min_length=3, max_length=2000)
+    aadhaar_front: str = Field(min_length=3, max_length=KYC_IMAGE_MAX_LENGTH)
+    aadhaar_back: str = Field(min_length=3, max_length=KYC_IMAGE_MAX_LENGTH)
     aadhaar_last4: str = Field(pattern=r"^\d{4}$")
-    dl_front: str = Field(min_length=3, max_length=2000)
-    dl_back: str = Field(min_length=3, max_length=2000)
+    dl_front: str = Field(min_length=3, max_length=KYC_IMAGE_MAX_LENGTH)
+    dl_back: str = Field(min_length=3, max_length=KYC_IMAGE_MAX_LENGTH)
     dl_number: str = Field(min_length=6, max_length=40)
     dl_expiry: str = ""
-    face_selfie: str = Field(min_length=3, max_length=2000)
+    face_selfie: str = Field(min_length=3, max_length=KYC_IMAGE_MAX_LENGTH)
+
+
+async def _store_kyc_document(kyc_id: str, field: str, data: str) -> str:
+    """Store one KYC document blob in GridFS, returning a file id reference."""
+    file_id = await fs_bucket.upload_from_stream(f"{kyc_id}_{field}", data.encode("utf-8"))
+    return str(file_id)
 
 
 async def _run_kyc_verification(kyc_id: str, user_id: str, payload: dict):
@@ -946,18 +1015,20 @@ async def _run_kyc_verification(kyc_id: str, user_id: str, payload: dict):
 
 @api_router.post("/kyc/submit")
 async def kyc_submit(payload: KYCSubmitRequest, user=Depends(get_current_user)):
+    check_rate_limit("kyc_submit", user)
     kyc_id = "kyc_" + uuid.uuid4().hex[:12]
+    image_fields = ("aadhaar_front", "aadhaar_back", "dl_front", "dl_back", "face_selfie")
+    file_ids = {
+        f"{field}_file_id": await _store_kyc_document(kyc_id, field, getattr(payload, field))
+        for field in image_fields
+    }
     doc = {
         "kyc_id": kyc_id,
         "user_id": user["user_id"],
-        "aadhaar_front": payload.aadhaar_front,
-        "aadhaar_back": payload.aadhaar_back,
+        **file_ids,
         "aadhaar_last4": payload.aadhaar_last4[-4:] if payload.aadhaar_last4 else "",
-        "dl_front": payload.dl_front,
-        "dl_back": payload.dl_back,
         "dl_number": payload.dl_number,
         "dl_expiry": payload.dl_expiry,
-        "face_selfie": payload.face_selfie,
         "provider": get_kyc_provider().name,
         "status": "processing",
         "rejection_reason": None,
@@ -969,7 +1040,19 @@ async def kyc_submit(payload: KYCSubmitRequest, user=Depends(get_current_user)):
         {"user_id": user["user_id"]},
         {"$set": {"kyc_status": "submitted", "current_kyc_id": kyc_id}}
     )
-    asyncio.create_task(_run_kyc_verification(kyc_id, user["user_id"], doc))
+    # The verifier needs the actual document content, not the GridFS refs just persisted -
+    # pass the raw submission through in-memory only; it is never itself written to Mongo.
+    raw_payload = {
+        "aadhaar_front": payload.aadhaar_front,
+        "aadhaar_back": payload.aadhaar_back,
+        "aadhaar_last4": payload.aadhaar_last4,
+        "dl_front": payload.dl_front,
+        "dl_back": payload.dl_back,
+        "dl_number": payload.dl_number,
+        "dl_expiry": payload.dl_expiry,
+        "face_selfie": payload.face_selfie,
+    }
+    asyncio.create_task(_run_kyc_verification(kyc_id, user["user_id"], raw_payload))
     return {"kyc_id": kyc_id, "status": "processing"}
 
 
@@ -991,8 +1074,10 @@ async def kyc_status(user=Depends(get_current_user)):
 # ============================================================
 class PaymentCreateRequest(BaseModel):
     booking_id: Optional[str] = None
+    subscription_id: Optional[str] = None
     amount: float
-    purpose: Literal["booking", "deposit", "wallet_topup"] = "booking"
+    purpose: Literal["booking", "deposit", "wallet_topup", "subscription", "subscription_renewal"] = "booking"
+    renewal_duration_months: Optional[int] = Field(default=None, ge=1, le=24)
     idempotency_key: Optional[str] = Field(default=None, max_length=120)
 
 
@@ -1003,14 +1088,14 @@ class PaymentConfirmRequest(BaseModel):
     razorpay_signature: Optional[str] = None
 
 
-async def _append_wallet_ledger(user_id: str, delta: float, reason: str, payment_id: str | None = None, ref_id: str | None = None):
+async def _append_wallet_ledger(user_id: str, delta: float, reason: str, payment_id: str | None = None, ref_id: str | None = None, actor_id: str | None = None):
     user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     new_balance = float(user.get("wallet_balance", 0)) + delta
     await db.users.update_one({"user_id": user_id}, {"$set": {"wallet_balance": new_balance}})
     await db.wallet_ledger.insert_one({
         "ledger_id": "wl_" + uuid.uuid4().hex[:12],
         "user_id": user_id, "delta": delta, "reason": reason,
-        "payment_id": payment_id, "ref_id": ref_id,
+        "payment_id": payment_id, "ref_id": ref_id, "actor_id": actor_id,
         "balance_after": new_balance, "created_at": utc_now(),
     })
     return new_balance
@@ -1030,8 +1115,23 @@ async def _append_miles_ledger(user_id: str, delta: int, reason: str, ref_id: st
     return new_balance
 
 
+@api_router.get("/wallet/ledger")
+async def wallet_ledger_history(user=Depends(get_current_user)):
+    """Read-only wallet transaction history for the current user, backing the
+    RideMiles/Wallet UI's real activity feed - no business logic here, just
+    exposing the already-existing append-only ledger."""
+    return await db.wallet_ledger.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
+
+
+@api_router.get("/ride-miles/ledger")
+async def ride_miles_ledger_history(user=Depends(get_current_user)):
+    """Read-only RideMiles transaction history for the current user."""
+    return await db.ride_miles_ledger.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
+
+
 @api_router.post("/payments/create")
 async def payments_create(payload: PaymentCreateRequest, user=Depends(get_current_user)):
+    check_rate_limit("payment_create", user)
     if payload.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
     if payload.idempotency_key:
@@ -1049,15 +1149,46 @@ async def payments_create(payload: PaymentCreateRequest, user=Depends(get_curren
         )
         if not booking:
             raise HTTPException(status_code=404, detail="Booking not found")
+        # Floor-check: the client can overpay (e.g. also covering the deposit
+        # in one charge, as the checkout screen does) but must never be able
+        # to pay less than what the booking actually owes - the amount is
+        # otherwise fully client-supplied and was previously never checked
+        # against the booking record at all.
+        if payload.amount + 0.01 < booking["total_amount"]:
+            raise HTTPException(status_code=400, detail="Amount is less than the booking total")
+
+    subscription = None
+    if payload.subscription_id:
+        subscription = await db.subscriptions.find_one(
+            {"subscription_id": payload.subscription_id, "user_id": user["user_id"]},
+            {"_id": 0},
+        )
+        if not subscription:
+            raise HTTPException(status_code=404, detail="Subscription not found")
+        if payload.purpose == "subscription_renewal":
+            if subscription["status"] not in ("active", "expired"):
+                raise HTTPException(status_code=422, detail=f"Cannot renew a {subscription['status']} subscription")
+            renewal = await SubscriptionService(db).renewal_quote(subscription, payload.renewal_duration_months)
+            if payload.amount + 0.01 < renewal["total_price"]:
+                raise HTTPException(status_code=400, detail="Amount is less than the renewal total")
+        else:
+            if subscription["status"] != "pending_payment":
+                raise HTTPException(status_code=422, detail=f"Subscription is already {subscription['status']}")
+            if payload.amount + 0.01 < subscription["total_price"]:
+                raise HTTPException(status_code=400, detail="Amount is less than the subscription total")
 
     gateway = get_payment_gateway()
     order = await gateway.create_order(amount=payload.amount, currency="INR",
-                                       meta={"booking_id": payload.booking_id, "user_id": user["user_id"]})
+                                       meta={"booking_id": payload.booking_id,
+                                             "subscription_id": payload.subscription_id,
+                                             "user_id": user["user_id"]})
     payment_id = "pay_" + uuid.uuid4().hex[:12]
     payment_doc = {
         "payment_id": payment_id,
         "user_id": user["user_id"],
         "booking_id": payload.booking_id,
+        "subscription_id": payload.subscription_id,
+        "renewal_duration_months": payload.renewal_duration_months,
         "purpose": payload.purpose,
         "amount": payload.amount,
         "currency": "INR",
@@ -1069,7 +1200,7 @@ async def payments_create(payload: PaymentCreateRequest, user=Depends(get_curren
         "failure_reason": None,
         "refund_amount": 0,
         "refund_status": "none",
-        "metadata": {"booking_id": payload.booking_id},
+        "metadata": {"booking_id": payload.booking_id, "subscription_id": payload.subscription_id},
         "idempotency_key": payload.idempotency_key,
         "created_at": utc_now(),
         "updated_at": utc_now(),
@@ -1086,16 +1217,28 @@ async def payments_create(payload: PaymentCreateRequest, user=Depends(get_curren
 
 @api_router.post("/payments/{payment_id}/confirm")
 async def payments_confirm(payment_id: str, payload: PaymentConfirmRequest, user=Depends(get_current_user)):
-    p = await db.payments.find_one(
-        {"payment_id": payment_id, "user_id": user["user_id"]},
-        {"_id": 0},
+    check_rate_limit("payment_confirm", user)
+    # Atomically claim the payment for processing so a racing webhook and a
+    # racing client confirm can't both pass the status check and double-process it.
+    p = await db.payments.find_one_and_update(
+        {"payment_id": payment_id, "user_id": user["user_id"], "status": "created"},
+        {"$set": {"status": "processing", "updated_at": utc_now()}},
+        return_document=ReturnDocument.BEFORE,
     )
     if not p:
-        raise HTTPException(status_code=404, detail="Payment not found")
-    if p["status"] not in ("created", "processing"):
-        return p
+        existing = await db.payments.find_one({"payment_id": payment_id, "user_id": user["user_id"]}, {"_id": 0})
+        if not existing:
+            raise HTTPException(status_code=404, detail="Payment not found")
+        if existing["status"] == "processing":
+            # Someone else (e.g. the Razorpay webhook) is confirming this payment right now.
+            # Poll briefly for it to settle instead of racing a second confirmation.
+            for _ in range(10):
+                await asyncio.sleep(0.3)
+                existing = await db.payments.find_one({"payment_id": payment_id, "user_id": user["user_id"]}, {"_id": 0})
+                if existing["status"] != "processing":
+                    break
+        return existing
 
-    await db.payments.update_one({"payment_id": payment_id}, {"$set": {"status": "processing", "updated_at": utc_now()}})
     gateway = get_payment_gateway()
     is_mock = p.get("provider") == "mock"
     # Honour test override on Mock gateway only:
@@ -1141,6 +1284,30 @@ async def payments_confirm(payment_id: str, payload: PaymentConfirmRequest, user
             await _append_wallet_ledger(user["user_id"], p["amount"], "topup", payment_id=payment_id)
             await publish_event(user["user_id"], "wallet.topped_up", {"payment_id": payment_id, "amount": p["amount"]})
             await emit_domain_event("PaymentCompleted", {"payment_id": payment_id, "amount": p["amount"], "purpose": "wallet_topup"}, user["user_id"])
+        elif p.get("subscription_id") and p.get("purpose") == "subscription_renewal":
+            sub = await SubscriptionService(db, commission_service=CommissionService(db)).renew(
+                p["subscription_id"], user_id=user["user_id"],
+                duration_months=p.get("renewal_duration_months"), payment_id=payment_id,
+            )
+            payout = await PayoutService(db).create_payout_for_subscription_payment(sub, payment_id=payment_id)
+            await NotificationService(db, get_push_sender()).notify(
+                user_id=user["user_id"], title="Subscription renewed",
+                body=f"Your {sub['vehicle_snapshot']['name']} subscription is renewed until {sub['end_date'][:10]}.",
+                ntype="subscription",
+            )
+            await emit_domain_event("PaymentCompleted", {"payment_id": payment_id, "subscription_id": p["subscription_id"], "amount": p["amount"]}, user["user_id"])
+            await emit_domain_event("PayoutCreated", {"subscription_id": p["subscription_id"], "payout_id": payout["payout_id"], "net_amount": payout["net_amount"]}, sub["owner_id"])
+        elif p.get("subscription_id"):
+            sub = await SubscriptionService(db).activate(p["subscription_id"], payment_id=payment_id)
+            if sub:
+                payout = await PayoutService(db).create_payout_for_subscription_payment(sub, payment_id=payment_id)
+                await NotificationService(db, get_push_sender()).notify(
+                    user_id=user["user_id"], title="Subscription activated",
+                    body=f"Your {sub['vehicle_snapshot']['name']} subscription is active until {sub['end_date'][:10]}.",
+                    ntype="subscription",
+                )
+                await emit_domain_event("PaymentCompleted", {"payment_id": payment_id, "subscription_id": p["subscription_id"], "amount": p["amount"]}, user["user_id"])
+                await emit_domain_event("PayoutCreated", {"subscription_id": p["subscription_id"], "payout_id": payout["payout_id"], "net_amount": payout["net_amount"]}, sub["owner_id"])
     else:
         await db.payments.update_one({"payment_id": payment_id}, {"$set": {
             "status": "failed",
@@ -1188,6 +1355,148 @@ async def payments_get(payment_id: str, user=Depends(get_current_user)):
     if not p:
         raise HTTPException(status_code=404, detail="Payment not found")
     return p
+
+
+# ---------- Subscriptions ----------
+async def _require_feature(flag: str, user: dict) -> None:
+    if not await FeatureFlagService(db).enabled(flag, user):
+        raise HTTPException(status_code=403, detail=f"'{flag}' is not enabled on this account/environment yet")
+
+
+class SubscriptionCreateRequest(BaseModel):
+    vehicle_id: str
+    duration_months: int = Field(ge=1, le=24)
+
+
+class SubscriptionCancelRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class SubscriptionUsageRequest(BaseModel):
+    odometer_reading: float = Field(ge=0)
+
+
+@api_router.get("/subscriptions/vehicles/{vehicle_id}/quote")
+async def subscription_quote(vehicle_id: str, duration_months: int = 1, user=Depends(get_current_user)):
+    await _require_feature("subscriptions", user)
+    vehicle = await db.vehicles.find_one({"vehicle_id": vehicle_id}, {"_id": 0})
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    return await SubscriptionService(db).quote(vehicle, duration_months)
+
+
+@api_router.post("/subscriptions")
+async def create_subscription(payload: SubscriptionCreateRequest, user=Depends(get_current_user)):
+    await _require_feature("subscriptions", user)
+    check_rate_limit("subscription_create", user)
+    vehicle = await db.vehicles.find_one({"vehicle_id": payload.vehicle_id}, {"_id": 0})
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    sub = await SubscriptionService(db, commission_service=CommissionService(db)).create_subscription(
+        user=user, vehicle=vehicle, duration_months=payload.duration_months,
+    )
+    await emit_domain_event("SubscriptionCreated", {"subscription_id": sub["subscription_id"], "vehicle_id": sub["vehicle_id"]}, user["user_id"])
+    return sub
+
+
+@api_router.get("/subscriptions")
+async def my_subscriptions(user=Depends(get_current_user)):
+    return await db.subscriptions.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+
+@api_router.get("/subscriptions/{subscription_id}")
+async def get_subscription(subscription_id: str, user=Depends(get_current_user)):
+    sub = await db.subscriptions.find_one({"subscription_id": subscription_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    return sub
+
+
+@api_router.post("/subscriptions/{subscription_id}/usage")
+async def subscription_usage(subscription_id: str, payload: SubscriptionUsageRequest, user=Depends(get_current_user)):
+    sub = await db.subscriptions.find_one({"subscription_id": subscription_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    return await SubscriptionService(db).record_usage(subscription_id, odometer_reading=payload.odometer_reading)
+
+
+@api_router.get("/subscriptions/{subscription_id}/renew/quote")
+async def subscription_renewal_quote(subscription_id: str, duration_months: Optional[int] = None, user=Depends(get_current_user)):
+    """Renewal is a new billing cycle and must be paid for - this only quotes
+    the price. The customer pays via POST /payments/create with
+    purpose="subscription_renewal", and the renewal itself is applied on
+    payment confirmation (see payments_confirm), exactly like initial
+    subscription activation. There is no free/unpaid renewal path."""
+    check_rate_limit("subscription_renew", user)
+    sub = await db.subscriptions.find_one({"subscription_id": subscription_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if sub["status"] not in ("active", "expired"):
+        raise HTTPException(status_code=422, detail=f"Cannot renew a {sub['status']} subscription")
+    return await SubscriptionService(db).renewal_quote(sub, duration_months)
+
+
+@api_router.post("/subscriptions/{subscription_id}/cancel")
+async def cancel_subscription(subscription_id: str, payload: SubscriptionCancelRequest, user=Depends(get_current_user)):
+    check_rate_limit("subscription_cancel", user)
+    return await SubscriptionService(db).cancel(subscription_id, user_id=user["user_id"], reason=payload.reason)
+
+
+# ---------- Vehicle Swap (requires an active subscription) ----------
+class SwapCreateRequest(BaseModel):
+    new_vehicle_id: str
+    odometer_old: Optional[float] = Field(default=None, ge=0)
+
+
+@api_router.get("/subscriptions/{subscription_id}/swap/quote")
+async def swap_quote(subscription_id: str, new_vehicle_id: str, user=Depends(get_current_user)):
+    await _require_feature("vehicle_swap", user)
+    sub = await db.subscriptions.find_one({"subscription_id": subscription_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    new_vehicle = await db.vehicles.find_one({"vehicle_id": new_vehicle_id}, {"_id": 0})
+    if not new_vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    return VehicleSwapService(db).quote_fee(
+        old_monthly_price=sub["monthly_price"], old_category=sub["vehicle_snapshot"]["type"],
+        new_vehicle=new_vehicle, subscription=sub,
+    )
+
+
+@api_router.post("/subscriptions/{subscription_id}/swap")
+async def create_swap(subscription_id: str, payload: SwapCreateRequest, user=Depends(get_current_user)):
+    await _require_feature("vehicle_swap", user)
+    check_rate_limit("vehicle_swap", user)
+    sub = await db.subscriptions.find_one({"subscription_id": subscription_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    new_vehicle = await db.vehicles.find_one({"vehicle_id": payload.new_vehicle_id}, {"_id": 0})
+    if not new_vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    swap_service = VehicleSwapService(db)
+    await swap_service.check_eligibility(sub)
+    requires_approval = await FeatureFlagService(db).enabled("vehicle_swap_requires_approval", user)
+    swap = await swap_service.create_swap(
+        subscription=sub, new_vehicle=new_vehicle, user_id=user["user_id"],
+        odometer_old=payload.odometer_old, auto_complete=not requires_approval,
+    )
+    await NotificationService(db, get_push_sender()).notify(
+        user_id=user["user_id"],
+        title="Vehicle swap requested" if swap["status"] == "requested" else "Vehicle swapped",
+        body=f"Swap to {new_vehicle['name']} is {swap['status']}.",
+        ntype="vehicle_swap",
+    )
+    await emit_domain_event("VehicleSwapRequested", {"swap_id": swap["swap_id"], "subscription_id": subscription_id}, user["user_id"])
+    return swap
+
+
+@api_router.get("/subscriptions/{subscription_id}/swaps")
+async def subscription_swap_history(subscription_id: str, user=Depends(get_current_user)):
+    sub = await db.subscriptions.find_one({"subscription_id": subscription_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    return await db.vehicle_swaps.find({"subscription_id": subscription_id}, {"_id": 0}).sort("created_at", -1).to_list(50)
 
 
 # ---------- Vehicles ----------
@@ -1395,7 +1704,9 @@ async def compare_vehicles(payload: CompareRequest, user=Depends(get_current_use
 # ---------- Bookings ----------
 @api_router.post("/bookings")
 async def create_booking(payload: BookingCreate, user=Depends(get_current_user)):
-    booking = await BookingService(db, utc_now).create_booking(payload, user)
+    check_rate_limit("booking_create", user)
+    booking_service = BookingService(db, utc_now, commission_service=CommissionService(db))
+    booking = await booking_service.create_booking(payload, user)
     await emit_domain_event("BookingCreated", {"booking_id": booking["booking_id"], "vehicle_id": booking["vehicle_id"]}, user["user_id"])
     return booking
 
@@ -1429,6 +1740,7 @@ async def start_trip(booking_id: str, user=Depends(get_current_user)):
         {"$set": {"status": "active", "odometer_start": before["odometer_value"], "started_at": utc_now(),
                   "inspection_before_id": before["inspection_id"]}}
     )
+    await get_gps_provider().start_tracking(vehicle_id=b["vehicle_id"], booking_id=booking_id)
     await emit_domain_event("TripStarted", {"booking_id": booking_id}, user["user_id"])
     return {"ok": True, "status": "active"}
 
@@ -1452,25 +1764,41 @@ async def end_trip(booking_id: str, user=Depends(get_current_user)):
                   "miles_earned": miles_traveled}}
     )
     await _append_miles_ledger(user["user_id"], miles_traveled, "distance", ref_id=booking_id)
+    await get_gps_provider().stop_tracking(vehicle_id=b["vehicle_id"], booking_id=booking_id)
     # Update vehicle lifetime km
     await db.vehicles.update_one(
         {"vehicle_id": b["vehicle_id"]},
         {"$inc": {"lifetime_km": miles_traveled, "trips": 1}}
     )
+    completed_booking = await db.bookings.find_one({"booking_id": booking_id}, {"_id": 0})
+    payout = await PayoutService(db).create_payout_for_booking(completed_booking)
+    milestone_events = await ServiceMilestoneService(db).check_and_award(b["vehicle_id"])
+    for milestone in milestone_events:
+        if milestone.get("owner_id"):
+            await NotificationService(db, get_push_sender()).notify(
+                user_id=milestone["owner_id"], title="Service milestone reached",
+                body=f"Your vehicle crossed {milestone['milestone_km']:,} km on Raidex - a service benefit is now eligible.",
+                ntype="service_milestone",
+            )
     await emit_domain_event("TripCompleted", {"booking_id": booking_id, "miles_earned": miles_traveled}, user["user_id"])
+    await emit_domain_event("PayoutCreated", {"booking_id": booking_id, "payout_id": payout["payout_id"], "net_amount": payout["net_amount"]}, b["owner_id"])
     return {"ok": True, "status": "completed", "miles_earned": miles_traveled, "distance_km": miles_traveled,
-            "ai_verdict": (after.get("damage_comparison") or {}).get("verdict", "clean")}
+            "ai_verdict": (after.get("damage_comparison") or {}).get("verdict", "clean"),
+            "payout_id": payout["payout_id"], "milestones_reached": [m["milestone_km"] for m in milestone_events]}
 
 
 @api_router.post("/bookings/{booking_id}/cancel")
 async def cancel_booking(booking_id: str, payload: BookingCancelRequest, user=Depends(get_current_user)):
-    result = await BookingService(db, utc_now).cancel_booking(booking_id, payload, user)
+    check_rate_limit("booking_cancel", user)
+    booking_service = BookingService(db, utc_now, get_payment_gateway, _append_wallet_ledger)
+    result = await booking_service.cancel_booking(booking_id, payload, user)
     await emit_domain_event("BookingCancelled", {"booking_id": booking_id, "refund_due": result["refund_due"], "message": "Your booking was cancelled."}, user["user_id"])
     return result
 
 
 @api_router.post("/bookings/{booking_id}/extend")
 async def extend_booking(booking_id: str, payload: BookingExtendRequest, user=Depends(get_current_user)):
+    check_rate_limit("booking_extend", user)
     return await BookingService(db, utc_now).extend_booking(booking_id, payload, user)
 
 
@@ -1622,15 +1950,6 @@ class GpsTrackIn(BaseModel):
     heading: int = 0
 
 
-def _haversine_m(lat1, lng1, lat2, lng2):
-    from math import radians, sin, cos, sqrt, atan2
-    R = 6371000
-    p1, p2 = radians(lat1), radians(lat2)
-    dp, dl = radians(lat2 - lat1), radians(lng2 - lng1)
-    a = sin(dp/2)**2 + cos(p1) * cos(p2) * sin(dl/2)**2
-    return 2 * R * atan2(sqrt(a), sqrt(1 - a))
-
-
 @api_router.post("/gps/track")
 async def gps_track(payload: GpsTrackIn, user=Depends(get_current_user)):
     veh = await db.vehicles.find_one({"vehicle_id": payload.vehicle_id}, {"_id": 0})
@@ -1641,38 +1960,17 @@ async def gps_track(payload: GpsTrackIn, user=Depends(get_current_user)):
         b = await db.bookings.find_one({"booking_id": payload.booking_id, "user_id": user["user_id"]}, {"_id": 0})
         if not b or b["status"] != "active":
             raise HTTPException(status_code=403, detail="No active trip on this booking")
-    await db.gps_tracks.insert_one({
-        "track_id": "trk_" + uuid.uuid4().hex[:12],
-        "vehicle_id": payload.vehicle_id, "booking_id": payload.booking_id,
-        "lat": payload.lat, "lng": payload.lng,
-        "speed_kmph": payload.speed_kmph, "heading": payload.heading,
-        "recorded_at": utc_now(),
-    })
-    await db.vehicles.update_one(
-        {"vehicle_id": payload.vehicle_id},
-        {"$set": {"last_track_lat": payload.lat, "last_track_lng": payload.lng,
-                  "last_track_speed": payload.speed_kmph, "last_track_at": utc_now()}}
-    )
-    # Geofence evaluation
-    home_lat, home_lng = veh["latitude"], veh["longitude"]
-    radius = veh.get("home_geofence_radius_m", 25000)
-    dist = _haversine_m(home_lat, home_lng, payload.lat, payload.lng)
-    events = []
-    if dist > radius and not payload.booking_id:
-        evt = {"event_id": "evt_" + uuid.uuid4().hex[:10], "vehicle_id": payload.vehicle_id,
-               "owner_id": veh.get("owner_id", "usr_marketplace"), "booking_id": None,
-               "kind": "exit_home", "lat": payload.lat, "lng": payload.lng,
-               "meta": {"distance_m": int(dist)}, "acknowledged": False, "created_at": utc_now()}
-        await db.geofence_events.insert_one(evt)
-        events.append(evt["event_id"])
-    if payload.speed_kmph > 100:
-        evt = {"event_id": "evt_" + uuid.uuid4().hex[:10], "vehicle_id": payload.vehicle_id,
-               "owner_id": veh.get("owner_id", "usr_marketplace"), "booking_id": payload.booking_id,
-               "kind": "excess_speed", "lat": payload.lat, "lng": payload.lng,
-               "meta": {"speed_kmph": payload.speed_kmph}, "acknowledged": False, "created_at": utc_now()}
-        await db.geofence_events.insert_one(evt)
-        events.append(evt["event_id"])
-    return {"ok": True, "events": events}
+    result = await get_gps_provider().ingest_location(LocationEvent(
+        vehicle_id=payload.vehicle_id, lat=payload.lat, lng=payload.lng,
+        speed_kmph=payload.speed_kmph, heading=payload.heading, booking_id=payload.booking_id,
+    ))
+    return result
+
+
+@api_router.get("/admin/gps/health")
+async def admin_gps_health(user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    return await get_gps_provider().health()
 
 
 @api_router.get("/vehicles/{vehicle_id}/location")
@@ -1703,7 +2001,7 @@ async def booking_trail(booking_id: str, user=Depends(get_current_user)):
 @api_router.get("/geofence-events")
 async def geofence_events(user=Depends(get_current_user)):
     items = await db.geofence_events.find(
-        {"$or": [{"owner_id": user["user_id"]}, {"vehicle_id": {"$exists": True}}]},
+        {"owner_id": user["user_id"]},
         {"_id": 0},
     ).sort("created_at", -1).to_list(50)
     return items
@@ -1726,22 +2024,55 @@ async def mark_read(notification_id: str, user=Depends(get_current_user)):
 
 
 # ---------- Wallet ----------
+class WalletTopupRequest(BaseModel):
+    target_user_id: str = Field(min_length=1)
+    amount: float = Field(gt=0, le=50000)
+    reason: str = Field(min_length=3, max_length=300)
+    reference: Optional[str] = Field(default=None, max_length=120)
+
+
 @api_router.post("/wallet/topup")
-async def topup_wallet(amount: float, user=Depends(get_current_user)):
+async def topup_wallet(payload: WalletTopupRequest, user=Depends(get_current_user)):
     """
-    Admin-only wallet credit for customer support adjustments.
-    Direct top-up without a payment is a security risk — restrict to admin.
-    Real user top-ups must go through POST /payments/create with purpose=wallet_topup.
+    Admin-only wallet credit for customer support adjustments (goodwill credit,
+    off-flow refund top-up, etc). Always targets a specific customer's wallet -
+    never the calling admin's own account. Real self-service user top-ups must
+    go through POST /payments/create with purpose=wallet_topup.
     """
     _require_role(user, "admin")
-    if amount <= 0 or amount > 50000:
-        raise HTTPException(status_code=400, detail="Amount must be between 1 and 50000")
+    check_rate_limit("wallet_topup", user)
+    target = await db.users.find_one({"user_id": payload.target_user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Target user not found")
+
+    if payload.reference:
+        # Idempotency: a retried request with the same reference must not double-credit.
+        existing = await db.wallet_ledger.find_one(
+            {"ref_id": payload.reference, "reason": "admin_credit", "user_id": payload.target_user_id}, {"_id": 0},
+        )
+        if existing:
+            return {"ok": True, "added": payload.amount, "new_balance": existing["balance_after"], "deduped": True}
+
     new_balance = await _append_wallet_ledger(
-        user_id=user["user_id"],
-        delta=amount,
+        user_id=payload.target_user_id,
+        delta=payload.amount,
         reason="admin_credit",
+        ref_id=payload.reference,
+        actor_id=user["user_id"],
     )
-    return {"ok": True, "added": amount, "new_balance": new_balance}
+    await AuditLogger(db).log(
+        actor_id=user["user_id"], action="wallet.admin_credit",
+        target_type="user", target_id=payload.target_user_id,
+        before={"reason": payload.reason, "reference": payload.reference},
+        after={"amount": payload.amount, "new_balance": new_balance},
+    )
+    await NotificationService(db, get_push_sender()).notify(
+        user_id=payload.target_user_id,
+        title="Wallet credited",
+        body=f"Rs {payload.amount:.2f} was added to your Raidex wallet by support. Reason: {payload.reason}",
+        ntype="wallet",
+    )
+    return {"ok": True, "added": payload.amount, "new_balance": new_balance}
 
 
 # ---------- Owner stats (minimal) ----------
@@ -1848,10 +2179,20 @@ async def owner_bookings(user=Depends(get_current_user)):
 async def owner_earnings(user=Depends(get_current_user)):
     _require_role(user, "owner")
     bookings = await db.bookings.find({"owner_id": user["user_id"], "status": {"$in": ["confirmed", "active", "completed"]}}, {"_id": 0}).to_list(500)
-    total = sum(b["total_amount"] for b in bookings)
-    commission_rate = 0.15
-    gross = total
-    commission = round(gross * commission_rate, 2)
+    gross = round(sum(b["total_amount"] for b in bookings), 2)
+    # Prefer each booking's own commission snapshot (set at creation time via
+    # CommissionService) so historical figures don't move if the platform
+    # commission config changes later. Only bookings created before this
+    # snapshotting existed fall back to the *current* rate as a best effort.
+    commission_svc = CommissionService(db)
+    commission = 0.0
+    for b in bookings:
+        if "commission_amount" in b:
+            commission += b["commission_amount"]
+        else:
+            legacy = await commission_svc.calculate(b["total_amount"], vehicle_category=b.get("vehicle_snapshot", {}).get("type"), owner_id=user["user_id"])
+            commission += legacy["commission_amount"]
+    commission = round(commission, 2)
     net = round(gross - commission, 2)
     by_status = {}
     for b in bookings:
@@ -1868,7 +2209,20 @@ async def owner_earnings(user=Depends(get_current_user)):
 @api_router.get("/owner/payouts")
 async def owner_payouts(user=Depends(get_current_user)):
     _require_role(user, "owner")
-    return await db.payouts.find({"owner_id": user["user_id"]}, {"_id": 0}).sort("period_end", -1).to_list(50)
+    return await db.payouts.find({"owner_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+
+@api_router.get("/owner/subscriptions")
+async def owner_subscriptions(user=Depends(get_current_user)):
+    _require_role(user, "owner")
+    return await db.subscriptions.find({"owner_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+
+@api_router.get("/owner/service-benefits")
+async def owner_service_benefits(user=Depends(get_current_user)):
+    _require_role(user, "owner")
+    vehicle_ids = [v["vehicle_id"] for v in await db.vehicles.find({"owner_id": user["user_id"]}, {"_id": 0, "vehicle_id": 1}).to_list(500)]
+    return await db.service_benefits.find({"vehicle_id": {"$in": vehicle_ids}}, {"_id": 0}).sort("created_at", -1).to_list(200)
 
 
 @api_router.get("/owner/fleet-health")
@@ -1940,6 +2294,38 @@ async def owner_calendar(user=Depends(get_current_user)):
 # ============================================================
 # Admin Console (Slice 7)
 # ============================================================
+class CommissionConfigUpdate(BaseModel):
+    default_rate: Optional[float] = Field(default=None, ge=0, le=1)
+    category_overrides: Optional[dict[str, float]] = None
+    owner_overrides: Optional[dict[str, float]] = None
+
+
+@api_router.get("/admin/commission-config")
+async def get_commission_config(user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    return await CommissionService(db).get_config()
+
+
+@api_router.put("/admin/commission-config")
+async def update_commission_config(payload: CommissionConfigUpdate, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    check_rate_limit("commission_config_update", user)
+    before = await CommissionService(db).get_config()
+    updated = await CommissionService(db).set_config(
+        default_rate=payload.default_rate,
+        category_overrides=payload.category_overrides,
+        owner_overrides=payload.owner_overrides,
+        updated_by=user["user_id"],
+        now=utc_now(),
+    )
+    await AuditLogger(db).log(
+        actor_id=user["user_id"], action="commission.update",
+        target_type="platform_config", target_id="commission",
+        before=before, after=updated,
+    )
+    return updated
+
+
 @api_router.get("/admin/kpis")
 async def admin_kpis(user=Depends(get_current_user)):
     _require_role(user, "admin")
@@ -1951,11 +2337,12 @@ async def admin_kpis(user=Depends(get_current_user)):
     succeeded = await db.payments.find({"status": "succeeded"}, {"amount": 1, "_id": 0}).to_list(2000)
     revenue = round(sum(p["amount"] for p in succeeded), 2)
     open_geo = await db.geofence_events.count_documents({"acknowledged": False})
+    default_rate = await CommissionService(db).get_rate()
     return {
         "users": users_count, "vehicles": vehicles_count,
         "pending_verifications": pending_verifications, "active_trips": active_trips,
         "bookings": bookings_total, "revenue": revenue,
-        "open_geo_events": open_geo, "commission": round(revenue * 0.15, 2),
+        "open_geo_events": open_geo, "commission": round(revenue * default_rate, 2),
     }
 
 
@@ -2023,6 +2410,209 @@ async def admin_payments(status: Optional[str] = None, user=Depends(get_current_
         filt["status"] = status
     items = await db.payments.find(filt, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
     return items
+
+
+class PayoutMarkPaidRequest(BaseModel):
+    payment_reference: str = Field(min_length=1, max_length=200)
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+
+class PayoutMarkFailedRequest(BaseModel):
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+
+@api_router.get("/admin/payouts")
+async def admin_payouts(status: Optional[str] = None, owner_id: Optional[str] = None, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    filt = {}
+    if status:
+        filt["status"] = status
+    if owner_id:
+        filt["owner_id"] = owner_id
+    return await db.payouts.find(filt, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
+
+
+@api_router.post("/admin/payouts/{payout_id}/mark-paid")
+async def admin_mark_payout_paid(payout_id: str, payload: PayoutMarkPaidRequest, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    check_rate_limit("payout_mark_paid", user)
+    before = await db.payouts.find_one({"payout_id": payout_id}, {"_id": 0})
+    if not before:
+        raise HTTPException(status_code=404, detail="Payout not found")
+    if before["status"] == "paid":
+        return before
+    updated = await PayoutService(db).mark_paid(payout_id, payment_reference=payload.payment_reference, notes=payload.notes)
+    await AuditLogger(db).log(
+        actor_id=user["user_id"], action="payout.mark_paid", target_type="payout", target_id=payout_id,
+        before={"status": before["status"]}, after={"status": "paid", "payment_reference": payload.payment_reference},
+    )
+    await NotificationService(db, get_push_sender()).notify(
+        user_id=updated["owner_id"], title="Payout paid",
+        body=f"Rs {updated['net_amount']:.2f} for booking {updated['booking_id']} has been paid out.",
+        ntype="payout",
+    )
+    return updated
+
+
+@api_router.post("/admin/payouts/{payout_id}/mark-failed")
+async def admin_mark_payout_failed(payout_id: str, payload: PayoutMarkFailedRequest, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    before = await db.payouts.find_one({"payout_id": payout_id}, {"_id": 0})
+    if not before:
+        raise HTTPException(status_code=404, detail="Payout not found")
+    updated = await PayoutService(db).mark_failed(payout_id, notes=payload.notes)
+    await AuditLogger(db).log(
+        actor_id=user["user_id"], action="payout.mark_failed", target_type="payout", target_id=payout_id,
+        before={"status": before["status"]}, after={"status": "failed", "notes": payload.notes},
+    )
+    return updated
+
+
+class MilestoneThresholdsUpdate(BaseModel):
+    thresholds_km: list[int] = Field(min_length=1)
+
+
+@api_router.get("/service-milestones/config")
+async def get_milestone_config(user=Depends(get_current_user)):
+    """Read-only, non-admin-gated: any authenticated user (owner UI needs this
+    to render 'current mileage -> next milestone' progress) can read the
+    configured thresholds - they aren't sensitive, only changing them is."""
+    return {"thresholds_km": await ServiceMilestoneService(db).get_thresholds()}
+
+
+@api_router.get("/admin/service-milestones/config")
+async def admin_get_milestone_config(user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    return {"thresholds_km": await ServiceMilestoneService(db).get_thresholds()}
+
+
+@api_router.put("/admin/service-milestones/config")
+async def admin_set_milestone_config(payload: MilestoneThresholdsUpdate, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    if any(t <= 0 for t in payload.thresholds_km):
+        raise HTTPException(status_code=400, detail="Thresholds must be positive")
+    updated = await ServiceMilestoneService(db).set_thresholds(payload.thresholds_km, updated_by=user["user_id"])
+    await AuditLogger(db).log(
+        actor_id=user["user_id"], action="service_milestones.config_update",
+        target_type="platform_config", target_id="service_milestones", after=updated,
+    )
+    return updated
+
+
+@api_router.get("/admin/service-benefits")
+async def admin_service_benefits(status: Optional[str] = None, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    filt = {}
+    if status:
+        filt["status"] = status
+    return await db.service_benefits.find(filt, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
+
+
+@api_router.post("/admin/service-benefits/{benefit_id}/fulfill")
+async def admin_fulfill_service_benefit(benefit_id: str, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    benefit = await db.service_benefits.find_one({"benefit_id": benefit_id}, {"_id": 0})
+    if not benefit:
+        raise HTTPException(status_code=404, detail="Benefit not found")
+    await db.service_benefits.update_one(
+        {"benefit_id": benefit_id},
+        {"$set": {"status": "fulfilled", "fulfilled_at": utc_now()}},
+    )
+    await AuditLogger(db).log(
+        actor_id=user["user_id"], action="service_benefit.fulfill", target_type="service_benefit", target_id=benefit_id,
+        before={"status": benefit["status"]}, after={"status": "fulfilled"},
+    )
+    if benefit.get("owner_id"):
+        await NotificationService(db, get_push_sender()).notify(
+            user_id=benefit["owner_id"], title="Service benefit fulfilled",
+            body=f"Your vehicle's {benefit['milestone_km']} km service benefit has been fulfilled.",
+            ntype="service_milestone",
+        )
+    return await db.service_benefits.find_one({"benefit_id": benefit_id}, {"_id": 0})
+
+
+@api_router.get("/admin/reconciliation")
+async def admin_reconciliation(user=Depends(get_current_user)):
+    """Read-only wallet/RideMiles ledger health check - healthy/warning/mismatch
+    with diagnostics. Never auto-mutates a balance; a real mismatch needs a
+    human to review the ledger and decide the correction."""
+    _require_role(user, "admin")
+    return await LedgerReconciliationService(db).full_report()
+
+
+@api_router.get("/admin/subscriptions")
+async def admin_subscriptions(status: Optional[str] = None, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    filt = {}
+    if status:
+        filt["status"] = status
+    return await db.subscriptions.find(filt, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
+
+
+@api_router.get("/admin/vehicle-swaps")
+async def admin_vehicle_swaps(status: Optional[str] = None, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    filt = {}
+    if status:
+        filt["status"] = status
+    return await db.vehicle_swaps.find(filt, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
+
+
+@api_router.post("/admin/vehicle-swaps/{swap_id}/approve")
+async def admin_approve_swap(swap_id: str, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    swap = await VehicleSwapService(db).complete_swap(swap_id)
+    await AuditLogger(db).log(
+        actor_id=user["user_id"], action="vehicle_swap.approve", target_type="vehicle_swap", target_id=swap_id,
+        after={"status": swap["status"]},
+    )
+    return swap
+
+
+@api_router.post("/admin/vehicle-swaps/{swap_id}/reject")
+async def admin_reject_swap(swap_id: str, body: Optional[dict] = None, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    notes = (body or {}).get("notes")
+    swap = await VehicleSwapService(db).reject_swap(swap_id, notes=notes)
+    await AuditLogger(db).log(
+        actor_id=user["user_id"], action="vehicle_swap.reject", target_type="vehicle_swap", target_id=swap_id,
+        after={"status": swap["status"]},
+    )
+    return swap
+
+
+class FeatureFlagUpdate(BaseModel):
+    enabled: bool
+    roles: Optional[list[str]] = None
+    percentage: int = Field(default=100, ge=0, le=100)
+    internal_only: bool = False
+
+
+@api_router.get("/admin/feature-flags")
+async def admin_list_feature_flags(user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    return await db.feature_flags.find({}, {"_id": 0}).to_list(200)
+
+
+@api_router.put("/admin/feature-flags/{flag}")
+async def admin_set_feature_flag(flag: str, payload: FeatureFlagUpdate, user=Depends(get_current_user)):
+    """Admin-configurable feature flags (e.g. 'subscriptions', 'vehicle_swap',
+    'vehicle_swap_requires_approval') - flipping these on/off requires no
+    redeploy. Defaults stay OFF until an admin explicitly enables a feature
+    here, after it's been QA'd."""
+    _require_role(user, "admin")
+    before = await db.feature_flags.find_one({"flag": flag}, {"_id": 0})
+    doc = {
+        "flag": flag, "enabled": payload.enabled, "roles": payload.roles,
+        "percentage": payload.percentage, "internal_only": payload.internal_only,
+        "updated_by": user["user_id"], "updated_at": utc_now(),
+    }
+    await db.feature_flags.update_one({"flag": flag}, {"$set": doc}, upsert=True)
+    await AuditLogger(db).log(
+        actor_id=user["user_id"], action="feature_flag.update", target_type="feature_flag", target_id=flag,
+        before=before, after=doc,
+    )
+    return doc
 
 
 @api_router.get("/admin/geofence-events")
@@ -2120,7 +2710,8 @@ async def admin_system_health(user=Depends(get_current_user)):
         "payment_provider": os.getenv("PAYMENT_PROVIDER", "mock").lower(),
         "kyc_provider": os.getenv("KYC_PROVIDER", "stub").lower(),
         "push_provider": os.getenv("PUSH_PROVIDER", "log").lower(),
-        "llm_configured": bool(EMERGENT_LLM_KEY),
+        "gps_provider": get_gps_provider().name,
+        "llm_configured": get_ai_provider().name != "stub",
         "open_disputes": await db.disputes.count_documents({"status": {"$in": ["open", "investigating"]}}),
         "failed_payments_24h": await db.payments.count_documents({"status": "failed"}),
         "pending_kyc": await db.kyc_submissions.count_documents({"status": {"$in": ["processing", "submitted"]}}),
@@ -2224,18 +2815,37 @@ async def pricing_quote(payload: PricingQuoteRequest, user=Depends(get_current_u
     return quote
 # AI Nexus (Slice 8) — Support / Operations / Finance agents
 # ============================================================
-EMERGENT_LLM_KEY = os.getenv("EMERGENT_LLM_KEY", "")
-LLM_MODEL = ("anthropic", "claude-sonnet-4-6")
-
-SUPPORT_SYS = """You are Raidex Support, a warm and concise customer assistant for the Raidex mobility marketplace.
-Tagline: 'Drive More. Own Less.' Raidex offers car & bike rentals, monthly subscriptions, vehicle swap, RideMiles rewards, GPS-tracked safe trips and KYC-verified renters.
-Style: friendly, short sentences, action-oriented. If user asks for refund/booking changes, gather booking_id and tell them an agent will follow up if needed. Never make up policies — if unsure, say a human will confirm."""
+# Product claims in these prompts must match what's ACTUALLY implemented and
+# enabled - the agent must never describe a feature that doesn't exist yet.
+# Subscriptions/vehicle swap are only mentioned once their feature flags are on.
+BASE_SUPPORT_SYS = """You are Raidex Support, a warm and concise customer assistant for the Raidex mobility marketplace.
+Tagline: 'Drive More. Own Less.' Raidex offers car & bike rentals ({rental_terms}), RideMiles rewards, GPS-tracked trips, and KYC-verified renters.
+Style: friendly, short sentences, action-oriented. If user asks for refund/booking changes, gather booking_id and tell them an agent will follow up if needed.
+Never claim a feature, policy, or promotion exists unless you were explicitly told about it in this prompt or by the user. If unsure, say a human will confirm."""
 
 OPS_SYS = """You are Raidex Operations Analyst. You answer questions about bookings, vehicles, utilization, and fleet health for the admin team.
-You will be given a structured snapshot of platform metrics in each prompt. Base your answer ONLY on that data. Be terse, use bullet points, surface anomalies."""
+You will be given a structured snapshot of platform metrics in each prompt. Base your answer ONLY on that data. Be terse, use bullet points, surface anomalies.
+You are advisory only: you may recommend operational actions, but you never execute them (no refunds, bans, KYC decisions, payout or commission changes)."""
 
 FIN_SYS = """You are Raidex Finance Analyst for admin team. You only answer questions about revenue, payments, commissions, payouts, refunds.
-You will be given a structured snapshot of finance metrics in each prompt. Base your answer ONLY on that data. Use bullet points, surface revenue trends and risks."""
+You will be given a structured snapshot of finance metrics in each prompt. Base your answer ONLY on that data. Use bullet points, surface revenue trends and risks.
+You are advisory only: you never issue refunds, change commission configuration, or alter payout amounts - you only report and recommend."""
+
+
+async def _support_system_prompt() -> str:
+    # Subscriptions and vehicle swap are implemented (raidex_platform/subscriptions.py,
+    # raidex_platform/vehicle_swap.py) but stay feature-flagged OFF by default so the
+    # AI (and the rest of the product surface) only describes them once an admin has
+    # explicitly enabled the flag via PUT /admin/feature-flags/{flag} post-QA.
+    flags = FeatureFlagService(db, defaults={
+        "subscriptions": {"enabled": False}, "vehicle_swap": {"enabled": False},
+    })
+    terms = ["hourly", "daily", "weekly", "monthly rentals"]
+    if await flags.enabled("subscriptions"):
+        terms.append("monthly subscriptions")
+    if await flags.enabled("vehicle_swap"):
+        terms.append("vehicle swap for subscribers")
+    return BASE_SUPPORT_SYS.format(rental_terms=", ".join(terms))
 
 
 async def _ops_snapshot() -> str:
@@ -2258,7 +2868,8 @@ async def _fin_snapshot() -> str:
     refunded = await db.payments.find({"status": "refunded"}, {"refund_amount": 1, "_id": 0}).to_list(500)
     gross = round(sum(p["amount"] for p in succeeded), 2)
     refund_total = round(sum(p.get("refund_amount", 0) for p in refunded), 2)
-    commission = round(gross * 0.15, 2)
+    default_rate = await CommissionService(db).get_rate()
+    commission = round(gross * default_rate, 2)
     import json as _json
     snap = {
         "gross_revenue_inr": gross, "platform_commission_inr": commission,
@@ -2276,12 +2887,15 @@ class NexusChat(BaseModel):
 
 @api_router.post("/nexus/support/chat")
 async def nexus_support(payload: NexusChat, user=Depends(get_current_user)):
-    return await _run_agent("support", SUPPORT_SYS, payload, user, snapshot=None)
+    check_rate_limit("nexus_support", user)
+    system = await _support_system_prompt()
+    return await _run_agent("support", system, payload, user, snapshot=None)
 
 
 @api_router.post("/nexus/ops/query")
 async def nexus_ops(payload: NexusChat, user=Depends(get_current_user)):
     _require_role(user, "admin")
+    check_rate_limit("nexus_ops", user)
     snap = await _ops_snapshot()
     return await _run_agent("operations", OPS_SYS, payload, user, snapshot=snap)
 
@@ -2289,13 +2903,12 @@ async def nexus_ops(payload: NexusChat, user=Depends(get_current_user)):
 @api_router.post("/nexus/finance/query")
 async def nexus_finance(payload: NexusChat, user=Depends(get_current_user)):
     _require_role(user, "admin")
+    check_rate_limit("nexus_finance", user)
     snap = await _fin_snapshot()
     return await _run_agent("finance", FIN_SYS, payload, user, snapshot=snap)
 
 
 async def _run_agent(agent: str, system: str, payload: NexusChat, user: dict, snapshot: str | None):
-    if not EMERGENT_LLM_KEY:
-        raise HTTPException(status_code=500, detail="LLM key not configured")
     thread_id = payload.thread_id or ("thr_" + uuid.uuid4().hex[:12])
     # Persist user message
     await db.support_threads.update_one(
@@ -2316,17 +2929,11 @@ async def _run_agent(agent: str, system: str, payload: NexusChat, user: dict, sn
     if snapshot:
         prompt_text = snapshot + "\n\nAdmin question: " + payload.message
     started = datetime.now(timezone.utc)
+    provider = get_ai_provider()
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
-        chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=thread_id, system_message=system).with_model(*LLM_MODEL)
-        # Replay prior turns (except the just-inserted user message — library will manage going forward)
-        for m in history[:-1]:
-            if m["role"] == "user":
-                await chat.send_message(UserMessage(text=m["content"]))
-                # Note: send_message creates a turn; we discard the assistant reply because we have it stored.
-                # In practice for MVP we let the library rebuild via the current message only — keep it simple.
-                break
-        reply = await chat.send_message(UserMessage(text=prompt_text))
+        # Replay prior turns as context (everything except the just-inserted user message).
+        turns = [ChatTurn(role=m["role"], content=m["content"]) for m in history[:-1]]
+        reply = await provider.chat(system=system, history=turns, message=prompt_text)
         latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
         await db.support_messages.insert_one({
             "message_id": "msg_" + uuid.uuid4().hex[:10], "thread_id": thread_id,
@@ -2335,25 +2942,44 @@ async def _run_agent(agent: str, system: str, payload: NexusChat, user: dict, sn
         await db.agent_runs.insert_one({
             "run_id": "run_" + uuid.uuid4().hex[:10], "agent": agent,
             "user_id": user["user_id"], "input": payload.message, "output": reply,
-            "model": f"{LLM_MODEL[0]}:{LLM_MODEL[1]}", "latency_ms": latency_ms,
+            "model": provider.name, "latency_ms": latency_ms,
             "error": None, "created_at": utc_now(),
         })
         return {"thread_id": thread_id, "reply": reply}
     except Exception as e:
+        # Log full diagnostics server-side for observability, but never leak raw
+        # exception text (which can include provider internals) to the client.
         logger.exception("Nexus %s error: %s", agent, e)
         await db.agent_runs.insert_one({
             "run_id": "run_" + uuid.uuid4().hex[:10], "agent": agent,
             "user_id": user["user_id"], "input": payload.message, "output": None,
-            "model": f"{LLM_MODEL[0]}:{LLM_MODEL[1]}", "latency_ms": 0,
+            "model": provider.name, "latency_ms": 0,
             "error": str(e), "created_at": utc_now(),
         })
-        raise HTTPException(status_code=500, detail="AI agent error: " + str(e))
+        raise HTTPException(status_code=503, detail="Raidex AI assistant is temporarily unavailable. Please try again shortly.")
 
 
 @api_router.get("/nexus/threads/{thread_id}")
 async def nexus_thread(thread_id: str, user=Depends(get_current_user)):
     msgs = await db.support_messages.find({"thread_id": thread_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
     return msgs
+
+
+@api_router.get("/admin/nexus/health")
+async def nexus_health(user=Depends(get_current_user)):
+    """Observability for AI Nexus - which provider is active and its recent error rate,
+    so a broken/misconfigured AI provider is visible to admins rather than silently failing."""
+    _require_role(user, "admin")
+    provider = get_ai_provider()
+    recent = await db.agent_runs.find({}, {"_id": 0}).sort("created_at", -1).limit(50).to_list(50)
+    errors = [r for r in recent if r.get("error")]
+    return {
+        "provider": provider.name,
+        "is_real_provider": provider.name != "stub",
+        "recent_runs": len(recent),
+        "recent_errors": len(errors),
+        "last_error": errors[0] if errors else None,
+    }
 
 
 # ============================================================
@@ -2432,16 +3058,19 @@ async def razorpay_webhook(request: Request):
         rzp_payment_id = pay_entity.get("id")
 
         if rzp_order_id:
-            payment = await db.payments.find_one({"provider_order_id": rzp_order_id}, {"_id": 0})
-            if payment and payment.get("status") in ("created", "processing"):
-                await db.payments.update_one(
-                    {"provider_order_id": rzp_order_id},
-                    {"$set": {
-                        "status": "succeeded",
-                        "provider_payment_id": rzp_payment_id,
-                        "updated_at": utc_now(),
-                    }},
-                )
+            # Atomic claim: only finalize a payment that's still in its initial "created"
+            # state. If a client-side confirm has already moved it to "processing"/"succeeded",
+            # that request owns finalization and side effects - this avoids double-processing.
+            payment = await db.payments.find_one_and_update(
+                {"provider_order_id": rzp_order_id, "status": "created"},
+                {"$set": {
+                    "status": "succeeded",
+                    "provider_payment_id": rzp_payment_id,
+                    "updated_at": utc_now(),
+                }},
+                return_document=ReturnDocument.BEFORE,
+            )
+            if payment:
                 if payment.get("booking_id"):
                     booking = await db.bookings.find_one({"booking_id": payment["booking_id"]}, {"_id": 0})
                     if booking:
@@ -2495,85 +3124,138 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-@app.on_event("startup")
-async def startup():
+async def create_indexes(target_db) -> None:
+    """Create all MongoDB indexes for the app's collections.
+
+    Single source of truth for the index list - both the FastAPI startup hook
+    below and setup_mongodb.py call this, so the two can no longer drift out
+    of sync with each other.
+    """
     # ── Unique / identity indexes ──────────────────────────────────────────
-    await db.users.create_index("email", unique=True)
-    await db.users.create_index("user_id", unique=True)
-    await db.revoked_tokens.create_index("jti", unique=True)
-    await db.device_sessions.create_index("refresh_token", unique=True)
-    await db.device_sessions.create_index([("user_id", 1), ("last_seen_at", -1)])
-    await db.vehicles.create_index("vehicle_id", unique=True)
-    await db.vehicles.create_index([("owner_id", 1), ("created_at", -1)])
-    await db.vehicles.create_index([("available", 1), ("type", 1), ("price_per_day", 1)])
-    await db.vehicles.create_index([("distance_km", 1), ("rating", -1)])
-    await db.bookings.create_index("booking_id", unique=True)
-    await db.user_sessions.create_index("session_token", unique=True)
-    await db.push_tokens.create_index([("user_id", 1), ("token", 1)], unique=True)
+    await target_db.users.create_index("email", unique=True)
+    await target_db.users.create_index("user_id", unique=True)
+    await target_db.revoked_tokens.create_index("jti", unique=True)
+    await target_db.device_sessions.create_index("refresh_token", unique=True)
+    await target_db.device_sessions.create_index([("user_id", 1), ("last_seen_at", -1)])
+    await target_db.vehicles.create_index("vehicle_id", unique=True)
+    await target_db.vehicles.create_index([("owner_id", 1), ("created_at", -1)])
+    await target_db.vehicles.create_index([("available", 1), ("type", 1), ("price_per_day", 1)])
+    await target_db.vehicles.create_index([("distance_km", 1), ("rating", -1)])
+    await target_db.bookings.create_index("booking_id", unique=True)
+    await target_db.user_sessions.create_index("session_token", unique=True)
+    await target_db.push_tokens.create_index([("user_id", 1), ("token", 1)], unique=True)
 
     # ── Production query indexes (were missing — caused full collection scans) ─
     # bookings
-    await db.bookings.create_index([("user_id", 1), ("created_at", -1)])
-    await db.bookings.create_index([("owner_id", 1), ("created_at", -1)])
-    await db.bookings.create_index([("vehicle_id", 1), ("status", 1), ("start_date", 1), ("end_date", 1)])
-    await db.bookings.create_index("status")
+    await target_db.bookings.create_index([("user_id", 1), ("created_at", -1)])
+    await target_db.bookings.create_index([("owner_id", 1), ("created_at", -1)])
+    await target_db.bookings.create_index([("vehicle_id", 1), ("status", 1), ("start_date", 1), ("end_date", 1)])
+    await target_db.bookings.create_index("status")
 
     # payments
-    await db.payments.create_index([("user_id", 1), ("created_at", -1)])
-    await db.payments.create_index([("user_id", 1), ("idempotency_key", 1)], unique=True, sparse=True)
-    await db.payments.create_index("status")
-    await db.payments.create_index("provider_order_id")   # Razorpay webhook lookup
-    await db.webhook_events.create_index([("provider", 1), ("event_id", 1)], unique=True)
+    await target_db.payments.create_index([("user_id", 1), ("created_at", -1)])
+    await target_db.payments.create_index([("user_id", 1), ("idempotency_key", 1)], unique=True, sparse=True)
+    await target_db.payments.create_index("status")
+    await target_db.payments.create_index("provider_order_id")   # Razorpay webhook lookup
+    await target_db.webhook_events.create_index([("provider", 1), ("event_id", 1)], unique=True)
 
     # notifications
-    await db.notifications.create_index([("user_id", 1), ("created_at", -1)])
+    await target_db.notifications.create_index([("user_id", 1), ("created_at", -1)])
 
     # KYC
-    await db.kyc_submissions.create_index([("user_id", 1), ("submitted_at", -1)])
+    await target_db.kyc_submissions.create_index([("user_id", 1), ("submitted_at", -1)])
 
     # inspections — critical for start/end trip prerequisite checks
-    await db.inspections.create_index([("booking_id", 1), ("phase", 1)], unique=True)
+    await target_db.inspections.create_index([("booking_id", 1), ("phase", 1)], unique=True)
 
     # GPS
-    await db.gps_tracks.create_index([("booking_id", 1), ("recorded_at", 1)])
-    await db.gps_tracks.create_index([("vehicle_id", 1), ("recorded_at", -1)])
+    await target_db.gps_tracks.create_index([("booking_id", 1), ("recorded_at", 1)])
+    await target_db.gps_tracks.create_index([("vehicle_id", 1), ("recorded_at", -1)])
 
     # geofence
-    await db.geofence_events.create_index([("owner_id", 1), ("created_at", -1)])
-    await db.geofence_events.create_index("acknowledged")
+    await target_db.geofence_events.create_index([("owner_id", 1), ("created_at", -1)])
+    await target_db.geofence_events.create_index("acknowledged")
 
     # ledgers
-    await db.wallet_ledger.create_index([("user_id", 1), ("created_at", -1)])
-    await db.ride_miles_ledger.create_index([("user_id", 1), ("created_at", -1)])
+    await target_db.wallet_ledger.create_index([("user_id", 1), ("created_at", -1)])
+    await target_db.ride_miles_ledger.create_index([("user_id", 1), ("created_at", -1)])
 
     # customer product surfaces
-    await db.wishlist.create_index([("user_id", 1), ("vehicle_id", 1)], unique=True)
-    await db.wishlist.create_index([("user_id", 1), ("created_at", -1)])
-    await db.recently_viewed.create_index([("user_id", 1), ("vehicle_id", 1)], unique=True)
-    await db.recently_viewed.create_index([("user_id", 1), ("viewed_at", -1)])
-    await db.reviews.create_index([("vehicle_id", 1), ("created_at", -1)])
-    await db.reviews.create_index([("booking_id", 1), ("user_id", 1)], unique=True)
-    await db.disputes.create_index([("user_id", 1), ("created_at", -1)])
-    await db.disputes.create_index([("status", 1), ("created_at", -1)])
-    await db.referrals.create_index([("referrer_user_id", 1), ("referred_email", 1)], unique=True)
-    await db.coupons.create_index("code", unique=True)
-    await db.media_assets.create_index([("user_id", 1), ("created_at", -1)])
-    await db.media_assets.create_index("asset_id", unique=True)
+    await target_db.wishlist.create_index([("user_id", 1), ("vehicle_id", 1)], unique=True)
+    await target_db.wishlist.create_index([("user_id", 1), ("created_at", -1)])
+    await target_db.recently_viewed.create_index([("user_id", 1), ("vehicle_id", 1)], unique=True)
+    await target_db.recently_viewed.create_index([("user_id", 1), ("viewed_at", -1)])
+    await target_db.reviews.create_index([("vehicle_id", 1), ("created_at", -1)])
+    await target_db.reviews.create_index([("booking_id", 1), ("user_id", 1)], unique=True)
+    await target_db.disputes.create_index([("user_id", 1), ("created_at", -1)])
+    await target_db.disputes.create_index([("status", 1), ("created_at", -1)])
+    await target_db.referrals.create_index([("referrer_user_id", 1), ("referred_email", 1)], unique=True)
+    await target_db.coupons.create_index("code", unique=True)
+    await target_db.media_assets.create_index([("user_id", 1), ("created_at", -1)])
+    await target_db.media_assets.create_index("asset_id", unique=True)
 
     # support
-    await db.support_messages.create_index([("thread_id", 1), ("created_at", 1)])
+    await target_db.support_messages.create_index([("thread_id", 1), ("created_at", 1)])
 
     # platform services
-    await db.event_log.create_index([("name", 1), ("occurred_at", -1)])
-    await db.event_failures.create_index([("name", 1), ("occurred_at", -1)])
-    await db.notification_outbox.create_index([("status", 1), ("next_attempt_at", 1)])
-    await db.notification_preferences.create_index([("user_id", 1)], unique=True)
-    await db.analytics_events.create_index([("name", 1), ("created_at", -1)])
-    await db.audit_log.create_index([("target_type", 1), ("target_id", 1), ("created_at", -1)])
-    await db.feature_flags.create_index("flag", unique=True)
-    await db.job_runs.create_index([("job_name", 1), ("ran_at", -1)])
-    await db.observability_metrics.create_index([("metric", 1), ("created_at", -1)])
-    await db.pricing_quotes.create_index([("vehicle_id", 1), ("created_at", -1)])
+    await target_db.event_log.create_index([("name", 1), ("occurred_at", -1)])
+    await target_db.event_failures.create_index([("name", 1), ("occurred_at", -1)])
+    await target_db.notification_outbox.create_index([("status", 1), ("next_attempt_at", 1)])
+    await target_db.notification_preferences.create_index([("user_id", 1)], unique=True)
+    await target_db.analytics_events.create_index([("name", 1), ("created_at", -1)])
+    await target_db.audit_log.create_index([("target_type", 1), ("target_id", 1), ("created_at", -1)])
+    await target_db.feature_flags.create_index("flag", unique=True)
+    await target_db.job_runs.create_index([("job_name", 1), ("ran_at", -1)])
+    await target_db.observability_metrics.create_index([("metric", 1), ("created_at", -1)])
+    await target_db.pricing_quotes.create_index([("vehicle_id", 1), ("created_at", -1)])
+
+    # platform config / commission engine
+    await target_db.platform_config.create_index("config_id", unique=True)
+
+    # payouts - unique on booking_id enforces the one-payout-per-booking invariant
+    await target_db.payouts.create_index("payout_id", unique=True)
+    # Partial unique indexes: booking-sourced and subscription-sourced payouts
+    # each enforce their own one-payout-per-source invariant without colliding
+    # with each other's (necessarily absent) other identifier field.
+    await target_db.payouts.create_index(
+        "booking_id", unique=True, partialFilterExpression={"booking_id": {"$type": "string"}},
+    )
+    await target_db.payouts.create_index(
+        "payment_id", unique=True, partialFilterExpression={"source_type": "subscription", "payment_id": {"$type": "string"}},
+    )
+    await target_db.payouts.create_index([("owner_id", 1), ("created_at", -1)])
+    await target_db.payouts.create_index("status")
+    await target_db.payouts.create_index("source_type")
+
+    # service milestones
+    await target_db.service_milestones.create_index("config_id", unique=True)
+    await target_db.vehicle_service_progress.create_index("vehicle_id", unique=True)
+    await target_db.service_benefits.create_index("benefit_id", unique=True)
+    await target_db.service_benefits.create_index([("owner_id", 1), ("created_at", -1)])
+    await target_db.service_benefits.create_index("status")
+
+    # subscriptions
+    await target_db.subscriptions.create_index("subscription_id", unique=True)
+    await target_db.subscriptions.create_index([("user_id", 1), ("created_at", -1)])
+    await target_db.subscriptions.create_index([("vehicle_id", 1), ("status", 1)])
+
+    # vehicle swaps
+    await target_db.vehicle_swaps.create_index("swap_id", unique=True)
+    await target_db.vehicle_swaps.create_index([("subscription_id", 1), ("created_at", -1)])
+
+    # background job support collections
+    await target_db.job_notification_dedup.create_index("key", unique=True)
+    await target_db.payment_reconciliation_flags.create_index("payment_id", unique=True)
+    await target_db.fraud_flags.create_index([("user_id", 1), ("created_at", -1)])
+    await target_db.analytics_snapshots.create_index("taken_at")
+
+    # Note: KYC document blobs live in GridFS (bucket "kyc_documents"), which
+    # creates its own required indexes automatically on first upload.
+
+
+@app.on_event("startup")
+async def startup():
+    await create_indexes(db)
 
     await seed_data()
 
@@ -2581,8 +3263,14 @@ async def startup():
     from providers.push_sender import inject_db as push_inject_db
     push_inject_db(db)
 
+    # Inject DB into the GPS provider (PhoneGPSProvider today)
+    from providers.gps_provider import inject_db as gps_inject_db
+    gps_inject_db(db, utc_now)
+
     # Schedule daily owner anomaly cron at 09:00 IST (03:30 UTC)
     _schedule_owner_anomaly_cron()
+    # Schedule every job in the background-job registry to an actual handler
+    _schedule_background_jobs()
 
 
 def _schedule_owner_anomaly_cron():
@@ -2608,6 +3296,42 @@ def _schedule_owner_anomaly_cron():
             "APScheduler not installed — owner anomaly cron disabled. "
             "Add apscheduler to requirements.txt or run: python -m cron.owner_anomaly"
         )
+
+
+_SCHEDULE_KWARGS = {
+    "daily": {"trigger": "cron", "hour": 4, "minute": 0},
+    "hourly": {"trigger": "cron", "minute": 5},
+    "every_15_minutes": {"trigger": "interval", "minutes": 15},
+}
+
+
+def _schedule_background_jobs():
+    """Wire every job in `raidex_platform.jobs.default_job_registry()` to its real
+    handler in `raidex_platform.scheduled_jobs`, so nothing is registered as dead
+    metadata with no code behind it (see RAIDEX_IMPLEMENTATION_STATUS.md #28)."""
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from raidex_platform.scheduled_jobs import run_job
+
+        scheduler = AsyncIOScheduler(timezone="UTC")
+        runner = JobRunner(db, job_registry)
+        for job in job_registry.list_jobs():
+            schedule_kwargs = _SCHEDULE_KWARGS.get(job["schedule"])
+            if not schedule_kwargs:
+                logger.warning("Job '%s' has unknown schedule '%s' — not scheduled", job["name"], job["schedule"])
+                continue
+            handler_name = job["handler"]
+            scheduler.add_job(
+                (lambda hn=handler_name: asyncio.create_task(run_job(db, runner, hn))),
+                id=job["name"],
+                replace_existing=True,
+                misfire_grace_time=1800,
+                **schedule_kwargs,
+            )
+        scheduler.start()
+        logger.info("Background jobs scheduled: %s", ", ".join(j["name"] for j in job_registry.list_jobs()))
+    except ImportError:
+        logger.warning("APScheduler not installed — background jobs disabled.")
 
 
 @app.on_event("shutdown")

@@ -1,6 +1,14 @@
 import React, { useEffect, useRef, useState } from "react";
 import { View, Text, StyleSheet, Pressable, ActivityIndicator, Dimensions, Platform } from "react-native";
 import Svg, { Circle, Path, Defs, LinearGradient as SvgGradient, Stop, Line } from "react-native-svg";
+import Animated, {
+  useSharedValue,
+  useAnimatedStyle,
+  useAnimatedProps,
+  withTiming,
+  withDelay,
+  Easing,
+} from "react-native-reanimated";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
@@ -11,6 +19,10 @@ import { api } from "@/src/api/client";
 
 const { width } = Dimensions.get("window");
 const MAP_H = 360;
+
+// Animated wrapper so the current-position marker can ease its cx/cy toward
+// each new GPS/simulated tick instead of snapping discretely between points.
+const AnimatedCircle = Animated.createAnimatedComponent(Circle);
 
 // Simulated route fallback when GPS is unavailable (web / Expo Go)
 const ROUTE_OFFSETS = [
@@ -145,6 +157,53 @@ export default function ActiveTrip() {
     };
   }, [vehicle, booking, booking_id]);
 
+  // Map projection from lat/lng deltas → SVG coords. Computed unconditionally
+  // (with a null-safe fallback) so the marker-easing hooks below can run
+  // before the loading guard, as React's rules of hooks require.
+  const homeLat = vehicle?.latitude ?? 0;
+  const homeLng = vehicle?.longitude ?? 0;
+  const projScale = 5500;
+  const mapCx = width / 2;
+  const mapCy = MAP_H / 2;
+  const points = trail.map((p) => ({
+    x: mapCx + (p.lng - homeLng) * projScale,
+    y: mapCy - (p.lat - homeLat) * projScale * 1.5,
+  }));
+  const polyline = points.length > 1
+    ? points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ")
+    : "";
+  const cur = points[points.length - 1] || { x: mapCx, y: mapCy };
+
+  // Animated marker position — eases toward each new GPS/simulated tick
+  // rather than jumping discretely between points.
+  const markerCx = useSharedValue(mapCx);
+  const markerCy = useSharedValue(mapCy);
+  useEffect(() => {
+    markerCx.value = withTiming(cur.x, { duration: 900, easing: Easing.out(Easing.cubic) });
+    markerCy.value = withTiming(cur.y, { duration: 900, easing: Easing.out(Easing.cubic) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cur.x, cur.y]);
+  const markerOuterProps = useAnimatedProps(() => ({ cx: markerCx.value, cy: markerCy.value }));
+  const markerInnerProps = useAnimatedProps(() => ({ cx: markerCx.value, cy: markerCy.value }));
+
+  // "Trip started" cinematic entrance: map and stats card fade/scale in on
+  // mount, staggered ~80ms apart.
+  const mapEntrance = useSharedValue(0);
+  const statsEntrance = useSharedValue(0);
+  useEffect(() => {
+    mapEntrance.value = withTiming(1, { duration: tokens.motion.slow, easing: Easing.out(Easing.cubic) });
+    statsEntrance.value = withDelay(80, withTiming(1, { duration: tokens.motion.slow, easing: Easing.out(Easing.cubic) }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const mapEntranceStyle = useAnimatedStyle(() => ({
+    opacity: mapEntrance.value,
+    transform: [{ scale: 0.96 + mapEntrance.value * 0.04 }],
+  }));
+  const statsEntranceStyle = useAnimatedStyle(() => ({
+    opacity: statsEntrance.value,
+    transform: [{ scale: 0.94 + statsEntrance.value * 0.06 }, { translateY: (1 - statsEntrance.value) * 14 }],
+  }));
+
   if (!booking || !vehicle) {
     return (
       <View style={{ flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: c.surface }}>
@@ -152,21 +211,6 @@ export default function ActiveTrip() {
       </View>
     );
   }
-
-  // Map projection from lat/lng deltas → SVG coords
-  const homeLat = vehicle.latitude;
-  const homeLng = vehicle.longitude;
-  const scale = 5500;
-  const cx = width / 2;
-  const cy = MAP_H / 2;
-  const points = trail.map((p) => ({
-    x: cx + (p.lng - homeLng) * scale,
-    y: cy - (p.lat - homeLat) * scale * 1.5,
-  }));
-  const polyline = points.length > 1
-    ? points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ")
-    : "";
-  const cur = points[points.length - 1] || { x: cx, y: cy };
 
   const elapsedSec = Math.floor((Date.now() - startTimeRef.current) / 1000);
   const mm = String(Math.floor(elapsedSec / 60)).padStart(2, "0");
@@ -177,7 +221,7 @@ export default function ActiveTrip() {
 
   return (
     <View style={{ flex: 1, backgroundColor: c.surface }}>
-      <View style={{ height: MAP_H, width, backgroundColor: c.surface2 }}>
+      <Animated.View style={[{ height: MAP_H, width, backgroundColor: c.surface2 }, mapEntranceStyle]}>
         <Svg width={width} height={MAP_H}>
           <Defs>
             <SvgGradient id="bg" x1="0" y1="0" x2="0" y2="1">
@@ -191,11 +235,11 @@ export default function ActiveTrip() {
           {Array.from({ length: 14 }).map((_, i) => (
             <Line key={`v${i}`} x1={i * 30} y1={0} x2={i * 30} y2={MAP_H} stroke={c.border} strokeWidth={1} />
           ))}
-          <Circle cx={cx} cy={cy} r={120} stroke={c.accent} strokeWidth={1.5} strokeDasharray="6,6" fill="rgba(5,196,107,0.08)" />
-          <Circle cx={cx} cy={cy} r={6} fill={c.accent} />
+          <Circle cx={mapCx} cy={mapCy} r={120} stroke={c.accent} strokeWidth={1.5} strokeDasharray="6,6" fill="rgba(5,196,107,0.08)" />
+          <Circle cx={mapCx} cy={mapCy} r={6} fill={c.accent} />
           {polyline && <Path d={polyline} stroke={c.accent} strokeWidth={4} fill="none" strokeLinecap="round" strokeLinejoin="round" />}
-          <Circle cx={cur.x} cy={cur.y} r={14} fill={c.inverse} />
-          <Circle cx={cur.x} cy={cur.y} r={6} fill={c.accent} />
+          <AnimatedCircle animatedProps={markerOuterProps} r={14} fill={c.inverse} />
+          <AnimatedCircle animatedProps={markerInnerProps} r={6} fill={c.accent} />
         </Svg>
         <SafeAreaView edges={["top"]} style={{ position: "absolute", left: 0, right: 0, top: 0 }}>
           <View style={{ flexDirection: "row", justifyContent: "space-between", padding: tokens.spacing.lg }}>
@@ -210,16 +254,18 @@ export default function ActiveTrip() {
             </View>
           </View>
         </SafeAreaView>
-      </View>
+      </Animated.View>
 
       <View style={{ flex: 1, padding: tokens.spacing.xl }}>
-        <LinearGradient colors={["#000", "#1a1a1a"]} style={styles.statsCard}>
-          <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
-            <Stat label="DURATION" val={`${mm}:${ss}`} />
-            <Stat label="DISTANCE" val={`${km} km`} />
-            <Stat label="SPEED" val={`${speed}`} sub="km/h" />
-          </View>
-        </LinearGradient>
+        <Animated.View style={statsEntranceStyle}>
+          <LinearGradient colors={["#000", "#1a1a1a"]} style={styles.statsCard}>
+            <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+              <Stat label="DURATION" val={`${mm}:${ss}`} />
+              <Stat label="DISTANCE" val={`${km} km`} />
+              <Stat label="SPEED" val={`${speed}`} sub="km/h" />
+            </View>
+          </LinearGradient>
+        </Animated.View>
 
         <View style={[styles.row, { backgroundColor: c.surface2, borderColor: c.border }]}>
           <View style={[styles.dot, { backgroundColor: c.accent }]} />

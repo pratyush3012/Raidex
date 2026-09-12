@@ -2,6 +2,21 @@
 """
 Raidex Backend - SQLite Version (No MongoDB Required!)
 Quick alternative for development/testing without external database.
+
+*** LOCAL DEVELOPMENT / TESTING FALLBACK ONLY - NEVER PRODUCTION ***
+
+This is a second, independently maintained implementation of the API surface
+that has drifted from backend/server.py in real ways: it has no production
+env-safety guard (backend/server.py._validate_env), no refresh-token model,
+KYC auto-verifies, and GPS/geofence endpoints are no-ops. A security or
+correctness fix made in server.py is NOT automatically reflected here.
+
+Nothing in this repository's deployment path (backend/Procfile,
+backend/render.yaml) points at this file - the canonical, MongoDB-backed
+backend/server.py is always what gets deployed. Do not add this file to any
+deployment config. It exists purely so a contributor without a MongoDB
+connection handy can run something locally; treat any behavior difference
+from server.py as this file being wrong, not as an alternate source of truth.
 """
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header, Request, status

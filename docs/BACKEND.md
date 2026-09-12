@@ -33,6 +33,7 @@ curl http://localhost:8000/api/health
 | Analytics, audit, events, jobs | `backend/raidex_platform/` |
 | Tests | `backend/tests/` |
 | Supabase SQL schema | `backend/supabase/migrations/001_initial_schema.sql` |
+| SQLite dev-only fallback (**never production** - see its own docstring) | `backend/server_sqlite.py` |
 
 ## Environment
 
@@ -52,6 +53,8 @@ ENV=development
 SENTRY_DSN=
 PAYMENT_PROVIDER=mock
 KYC_PROVIDER=stub
+AI_PROVIDER=              # unset | anthropic (needs ANTHROPIC_API_KEY)
+GPS_PROVIDER=phone        # only 'phone' implemented today
 RAIDEX_GSTIN=
 ```
 
@@ -61,6 +64,7 @@ Production rules:
 - `ALLOWED_ORIGINS` must be deployed domains, not localhost.
 - `PAYMENT_PROVIDER` must not be `mock`.
 - `KYC_PROVIDER` must not be `stub`.
+- `AI_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` recommended before enabling `/nexus/*` for real users - otherwise Nexus honestly tells users no AI is configured (`providers/ai_provider.py::StubAIProvider`), it never hallucinates.
 
 ## API Map
 
@@ -80,14 +84,30 @@ Version aliases: `/api/v1`, `/api/v2`
 | Bookings | `/bookings`, `/bookings/{id}`, `/bookings/{id}/cancel`, `/bookings/{id}/extend`, `/bookings/{id}/invoice` |
 | Payments | `/payments/create`, `/payments/{id}/confirm`, `/payments/{id}/refund`, `/webhooks/razorpay` |
 | Trips | `/bookings/{id}/start`, `/bookings/{id}/end`, `/gps/track`, `/bookings/{id}/trail` |
-| Owner | `/owner/stats`, `/owner/vehicles`, `/owner/bookings`, `/owner/earnings`, `/owner/calendar` |
-| Admin | `/admin/kpis`, `/admin/users`, `/admin/bookings`, `/admin/payments`, `/admin/disputes`, `/admin/system-health` |
+| Subscriptions (feature-flagged, see `/admin/feature-flags`) | `/subscriptions/vehicles/{id}/quote`, `/subscriptions`, `/subscriptions/{id}`, `/subscriptions/{id}/usage`, `/subscriptions/{id}/renew`, `/subscriptions/{id}/cancel` |
+| Vehicle swap (feature-flagged, requires an active subscription) | `/subscriptions/{id}/swap/quote`, `/subscriptions/{id}/swap`, `/subscriptions/{id}/swaps` |
+| Owner | `/owner/stats`, `/owner/vehicles`, `/owner/bookings`, `/owner/earnings`, `/owner/calendar`, `/owner/payouts`, `/owner/subscriptions`, `/owner/service-benefits` |
+| Admin | `/admin/kpis`, `/admin/users`, `/admin/bookings`, `/admin/payments`, `/admin/disputes`, `/admin/system-health`, `/admin/commission-config`, `/admin/payouts`, `/admin/reconciliation`, `/admin/subscriptions`, `/admin/vehicle-swaps`, `/admin/feature-flags`, `/admin/jobs`, `/admin/gps/health`, `/admin/nexus/health` |
 
 ## Business Logic
 
 Booking logic lives in `backend/features/booking/service.py`.
 
 Search `RAIDEX_BOOKING_SERVICE` for booking creation, KYC guard, availability conflicts, cancellation, extension, invoice, GST invoice, and disputes.
+
+Financial/domain services (each a single source of truth - never duplicate their logic inline):
+
+| Service | File |
+| --- | --- |
+| Commission (rate resolution, gross/commission/net split) | `raidex_platform/commission.py` |
+| Owner payouts (one per completed booking, idempotent) | `raidex_platform/payouts.py` |
+| Service milestones (cumulative mileage benefit crossing) | `raidex_platform/service_milestones.py` |
+| Subscriptions | `raidex_platform/subscriptions.py` |
+| Vehicle swap (built on an active subscription) | `raidex_platform/vehicle_swap.py` |
+| Ledger reconciliation (wallet/RideMiles, read-only) | `raidex_platform/reconciliation.py` |
+| Background job handlers (registered in `jobs.py`, real logic in `scheduled_jobs.py`) | `raidex_platform/jobs.py`, `raidex_platform/scheduled_jobs.py` |
+| GPS/telemetry (tracking/geofence/mileage only - never vehicle control) | `providers/gps_provider.py` |
+| AI Nexus provider (Support/Ops/Finance agents) | `providers/ai_provider.py` |
 
 ## Security
 

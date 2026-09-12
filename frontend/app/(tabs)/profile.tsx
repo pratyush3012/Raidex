@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { View, Text, StyleSheet, ScrollView, Pressable, Alert } from "react-native";
 import { Image } from "expo-image";
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -8,11 +8,25 @@ import { useRouter } from "expo-router";
 import { useTheme, tokens } from "@/src/theme";
 import { useAuth } from "@/src/context/AuthContext";
 import { api } from "@/src/api/client";
+import { RaidexSkeleton } from "@/src/components/ui";
+
+type WalletLedgerEntry = {
+  ledger_id: string;
+  delta: number;
+  reason: string;
+  balance_after: number;
+  created_at: string;
+};
 
 export default function ProfileScreen() {
   const c = useTheme();
   const router = useRouter();
   const { user, logout, refresh } = useAuth();
+  const [walletHistory, setWalletHistory] = useState<WalletLedgerEntry[] | null>(null);
+
+  useEffect(() => {
+    api<WalletLedgerEntry[]>("/wallet/ledger").then((data) => setWalletHistory(data.slice(0, 5))).catch(() => setWalletHistory([]));
+  }, []);
 
   const doKyc = () => {
     router.push("/kyc" as any);
@@ -80,6 +94,30 @@ export default function ProfileScreen() {
           </View>
         </LinearGradient>
 
+        {walletHistory === null ? (
+          <View style={{ gap: 8, marginTop: 12 }}>
+            <RaidexSkeleton height={44} radius={12} />
+            <RaidexSkeleton height={44} radius={12} />
+          </View>
+        ) : walletHistory.length > 0 ? (
+          <View style={[styles.menu, { backgroundColor: c.surface2, borderColor: c.border, marginTop: 12 }]} testID="wallet-history">
+            {walletHistory.map((entry, i) => (
+              <React.Fragment key={entry.ledger_id}>
+                {i > 0 && <Divider c={c} />}
+                <View style={styles.walletRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: c.onSurface, fontWeight: "600", fontSize: 13 }}>{entry.reason.replace(/_/g, " ")}</Text>
+                    <Text style={{ color: c.onSurface3, fontSize: 11, marginTop: 2 }}>{new Date(entry.created_at).toLocaleString()}</Text>
+                  </View>
+                  <Text style={{ color: entry.delta >= 0 ? c.accent : c.error, fontWeight: "800", fontSize: 14 }}>
+                    {entry.delta >= 0 ? "+" : ""}₹{entry.delta.toLocaleString()}
+                  </Text>
+                </View>
+              </React.Fragment>
+            ))}
+          </View>
+        ) : null}
+
         <View style={[styles.menu, { backgroundColor: c.surface2, borderColor: c.border }]}>
           <MenuRow c={c} icon="shield-checkmark" label={user?.kyc_status === "verified" ? "KYC Verified" : "Complete KYC"} onPress={doKyc} testID="kyc-row" />
           <Divider c={c} />
@@ -93,6 +131,8 @@ export default function ProfileScreen() {
         </View>
 
         <View style={[styles.menu, { backgroundColor: c.surface2, borderColor: c.border, marginTop: tokens.spacing.lg }]}>
+          <MenuRow c={c} icon="calendar" label="My Subscriptions" onPress={() => router.push("/subscriptions" as any)} testID="subscriptions-row" />
+          <Divider c={c} />
           <MenuRow c={c} icon="business" label="Host Dashboard" onPress={() => router.push("/owner" as any)} testID="owner-row" />
           <Divider c={c} />
           <MenuRow c={c} icon="sparkles" label="Raidex Support (AI)" onPress={() => router.push("/support" as any)} testID="support-row" />
@@ -132,4 +172,5 @@ const styles = StyleSheet.create({
   topupBtn: { flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: "#fff", paddingHorizontal: 14, paddingVertical: 10, borderRadius: 999 },
   menu: { borderRadius: 18, borderWidth: 1, overflow: "hidden", marginTop: 20 },
   row: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", padding: 16 },
+  walletRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", padding: 14 },
 });

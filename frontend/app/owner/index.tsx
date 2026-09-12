@@ -1,14 +1,30 @@
 import React, { useEffect, useState, useCallback } from "react";
-import { View, Text, StyleSheet, ScrollView, Pressable, TextInput, ActivityIndicator, Alert } from "react-native";
+import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, Alert } from "react-native";
 import { Image } from "expo-image";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
+import Animated, { useSharedValue, useAnimatedStyle, withTiming, withDelay, Easing } from "react-native-reanimated";
 import { useTheme, tokens } from "@/src/theme";
 import { api } from "@/src/api/client";
+import {
+  RaidexButton,
+  RaidexCard,
+  RaidexInput,
+  RaidexChip,
+  RaidexStatusPill,
+  RaidexMetricCard,
+  RaidexEmptyState,
+} from "@/src/components/ui";
 
 type Tab = "earnings" | "listings" | "bookings" | "add";
+
+// Ordered payout lifecycle (mirrors backend PAYOUT_STATUSES). Only
+// "eligible"/"paid"/"failed" are produced by the current flows, but the
+// track itself supports the full ordering so it stays correct if
+// "pending"/"processing" payouts appear later.
+const PAYOUT_STEPS = ["pending", "eligible", "processing", "paid"] as const;
+const PAYOUT_TERMINAL_NEGATIVE = ["failed", "cancelled", "disputed"];
 
 export default function OwnerDashboard() {
   const c = useTheme();
@@ -17,6 +33,9 @@ export default function OwnerDashboard() {
   const [earnings, setEarnings] = useState<any>(null);
   const [vehicles, setVehicles] = useState<any[]>([]);
   const [bookings, setBookings] = useState<any[]>([]);
+  const [payouts, setPayouts] = useState<any[]>([]);
+  const [milestoneThresholds, setMilestoneThresholds] = useState<number[]>([]);
+  const [serviceBenefits, setServiceBenefits] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [onboarded, setOnboarded] = useState(false);
 
@@ -31,6 +50,13 @@ export default function OwnerDashboard() {
       setEarnings(e);
       setVehicles(await api<any[]>("/owner/vehicles"));
       setBookings(await api<any[]>("/owner/bookings"));
+      setPayouts(await api<any[]>("/owner/payouts"));
+      const [milestoneCfg, benefits] = await Promise.all([
+        api<{ thresholds_km: number[] }>("/service-milestones/config").catch(() => ({ thresholds_km: [] })),
+        api<any[]>("/owner/service-benefits").catch(() => []),
+      ]);
+      setMilestoneThresholds(milestoneCfg.thresholds_km || []);
+      setServiceBenefits(benefits);
       setOnboarded(true);
     } catch (err: any) {
       if (err.message?.includes("owner role required")) setOnboarded(false);
@@ -45,35 +71,34 @@ export default function OwnerDashboard() {
         <SafeAreaView edges={["top"]} style={{ backgroundColor: c.surface }}>
           <View style={{ flexDirection: "row", alignItems: "center", padding: 20 }}>
             <Pressable onPress={() => router.back()} testID="back-btn"><Ionicons name="chevron-back" size={26} color={c.onSurface} /></Pressable>
-            <Text style={{ color: c.onSurface, fontSize: 20, fontWeight: "800", marginLeft: 8 }}>Become a host</Text>
+            <Text style={{ color: c.onSurface, fontSize: 20, fontWeight: tokens.weight.bold, marginLeft: 8 }}>Become a host</Text>
           </View>
         </SafeAreaView>
         <ScrollView contentContainerStyle={{ padding: 24 }}>
-          <LinearGradient colors={["#000", "#1a1a1a"]} style={{ padding: 24, borderRadius: 24 }}>
+          <RaidexCard variant="dark" padding={tokens.spacing.xl}>
             <Ionicons name="business" size={48} color="#05C46B" />
-            <Text style={{ color: "#fff", fontSize: 28, fontWeight: "800", marginTop: 16 }}>Earn ₹40,000+ per month</Text>
-            <Text style={{ color: "rgba(255,255,255,0.7)", marginTop: 8 }}>List your idle car or bike. Raidex handles bookings, payments, KYC. You keep 85%.</Text>
-          </LinearGradient>
+            <Text style={{ color: "#fff", fontSize: tokens.type.xxxl, fontWeight: tokens.weight.black, marginTop: 16 }}>Earn ₹40,000+ per month</Text>
+            <Text style={{ color: "rgba(255,255,255,0.7)", marginTop: 8 }}>List your idle car or bike. Raidex handles bookings, payments, and KYC — you keep your net earnings after platform commission.</Text>
+          </RaidexCard>
           <View style={{ marginTop: 20, gap: 12 }}>
             {[
               { ic: "shield-checkmark", t: "KYC-verified renters only", s: "All renters verified with Aadhaar + DL + face match" },
               { ic: "navigate", t: "GPS-tracked trips", s: "Live location, geofence alerts, mileage logged automatically" },
               { ic: "camera", t: "AI damage inspection", s: "Mandatory before/after photos with AI scoring" },
-              { ic: "card", t: "Weekly payouts", s: "Net earnings deposited to your account every Friday" },
+              { ic: "card", t: "Transparent payouts", s: "Net earnings, commission, and payout status tracked after every trip" },
             ].map((it) => (
               <View key={it.ic} style={[styles.row, { backgroundColor: c.surface2, borderColor: c.border }]}>
                 <View style={[styles.iconRound, { backgroundColor: c.accentBg }]}><Ionicons name={it.ic as any} size={20} color={c.onAccentBg} /></View>
                 <View style={{ flex: 1 }}>
-                  <Text style={{ color: c.onSurface, fontWeight: "700" }}>{it.t}</Text>
+                  <Text style={{ color: c.onSurface, fontWeight: tokens.weight.semibold }}>{it.t}</Text>
                   <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 2 }}>{it.s}</Text>
                 </View>
               </View>
             ))}
           </View>
-          <Pressable testID="onboard-btn" onPress={onboard} style={[styles.cta, { backgroundColor: c.inverse, marginTop: 24 }]}>
-            <Text style={{ color: c.onInverse, fontWeight: "800", fontSize: 16 }}>Activate host account</Text>
-            <Ionicons name="arrow-forward" size={18} color={c.onInverse} />
-          </Pressable>
+          <View style={{ marginTop: 24 }}>
+            <RaidexButton testID="onboard-btn" label="Activate host account" onPress={onboard} icon="arrow-forward" />
+          </View>
         </ScrollView>
       </View>
     );
@@ -84,13 +109,17 @@ export default function OwnerDashboard() {
       <SafeAreaView edges={["top"]} style={{ backgroundColor: c.surface }}>
         <View style={{ flexDirection: "row", alignItems: "center", padding: 20 }}>
           <Pressable onPress={() => router.back()} testID="back-btn"><Ionicons name="chevron-back" size={26} color={c.onSurface} /></Pressable>
-          <Text style={{ color: c.onSurface, fontSize: 20, fontWeight: "800", marginLeft: 8 }}>Host Dashboard</Text>
+          <Text style={{ color: c.onSurface, fontSize: 20, fontWeight: tokens.weight.bold, marginLeft: 8 }}>Host Dashboard</Text>
         </View>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 20, gap: 8, paddingBottom: 12 }} style={{ height: 56 }}>
           {(["earnings", "listings", "bookings", "add"] as Tab[]).map((t) => (
-            <Pressable key={t} testID={`owner-tab-${t}`} onPress={() => setTab(t)} style={[styles.chip, { backgroundColor: tab === t ? c.inverse : c.surface2, borderColor: tab === t ? c.inverse : c.border }]}>
-              <Text style={{ color: tab === t ? c.onInverse : c.onSurface, fontWeight: "700", textTransform: "capitalize" }}>{t === "add" ? "+ Vehicle" : t}</Text>
-            </Pressable>
+            <RaidexChip
+              key={t}
+              testID={`owner-tab-${t}`}
+              label={t === "add" ? "+ Vehicle" : t.charAt(0).toUpperCase() + t.slice(1)}
+              active={tab === t}
+              onPress={() => setTab(t)}
+            />
           ))}
         </ScrollView>
       </SafeAreaView>
@@ -100,73 +129,254 @@ export default function OwnerDashboard() {
 
         {tab === "earnings" && earnings && (
           <View>
-            <LinearGradient colors={["#05C46B", "#03A85A"]} style={{ padding: 24, borderRadius: 24 }}>
-              <Text style={{ color: "rgba(255,255,255,0.8)", fontSize: 11, fontWeight: "800", letterSpacing: 2 }}>NET PAYABLE</Text>
-              <Text testID="net-payable" style={{ color: "#fff", fontSize: 40, fontWeight: "800", marginTop: 6 }}>₹{earnings.net_payable.toLocaleString()}</Text>
-              <Text style={{ color: "rgba(255,255,255,0.85)", marginTop: 4 }}>Gross ₹{earnings.gross.toLocaleString()} · Commission ₹{earnings.commission.toLocaleString()} (15%)</Text>
-            </LinearGradient>
+            <RaidexCard variant="dark" padding={tokens.spacing.xl} testID="earnings-hero">
+              <Text style={{ color: "rgba(255,255,255,0.65)", fontSize: 11, fontWeight: tokens.weight.black, letterSpacing: 2 }}>NET PAYABLE</Text>
+              <Text testID="net-payable" style={{ color: "#fff", fontSize: tokens.type.hero, fontWeight: tokens.weight.black, marginTop: 6 }}>
+                ₹{earnings.net_payable.toLocaleString()}
+              </Text>
+
+              <View style={{ marginTop: tokens.spacing.lg, gap: 8 }}>
+                <FlowRow label="Gross earnings" value={`₹${earnings.gross.toLocaleString()}`} />
+                <FlowRow
+                  label={`RAIDEX commission${earnings.gross > 0 ? ` (${Math.round((earnings.commission / earnings.gross) * 100)}%)` : ""}`}
+                  value={`− ₹${earnings.commission.toLocaleString()}`}
+                  negative
+                />
+                <View style={{ height: 1, backgroundColor: "rgba(255,255,255,0.15)", marginVertical: 2 }} />
+                <FlowRow label="Net payable" value={`₹${earnings.net_payable.toLocaleString()}`} strong />
+              </View>
+            </RaidexCard>
+
             <View style={{ flexDirection: "row", gap: 10, marginTop: 16 }}>
-              <Kpi c={c} label="Vehicles" val={String(earnings.vehicles_count)} />
-              <Kpi c={c} label="Active trips" val={String(earnings.active_trips)} />
-              <Kpi c={c} label="Upcoming" val={String(earnings.future_bookings)} />
+              <RaidexMetricCard testID="kpi-vehicles" label="Vehicles" value={String(earnings.vehicles_count)} numeric={earnings.vehicles_count} icon="car" />
+              <RaidexMetricCard testID="kpi-active-trips" label="Active trips" value={String(earnings.active_trips)} numeric={earnings.active_trips} icon="navigate" />
+              <RaidexMetricCard testID="kpi-upcoming" label="Upcoming" value={String(earnings.future_bookings)} numeric={earnings.future_bookings} icon="calendar" />
             </View>
-            <Text style={{ color: c.onSurface, fontWeight: "800", fontSize: 16, marginTop: 24, marginBottom: 12 }}>Booking breakdown</Text>
+
+            <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: 16, marginTop: 24, marginBottom: 12 }}>Booking breakdown</Text>
             {Object.entries(earnings.by_status || {}).map(([k, v]: any) => (
-              <View key={k} style={[styles.row, { backgroundColor: c.surface2, borderColor: c.border, marginBottom: 8 }]}>
-                <Ionicons name="ellipse" size={10} color={k === "completed" ? c.accent : k === "active" ? c.warning : c.onSurface3} />
-                <Text style={{ color: c.onSurface, fontWeight: "600", textTransform: "capitalize", flex: 1 }}>{k}</Text>
-                <Text style={{ color: c.onSurface, fontWeight: "800" }}>{String(v)}</Text>
+              <View key={k} style={[styles.row, { backgroundColor: c.surface2, borderColor: c.border, marginBottom: 8, justifyContent: "space-between" }]}>
+                <RaidexStatusPill status={k} />
+                <Text style={{ color: c.onSurface, fontWeight: tokens.weight.black }}>{String(v)}</Text>
               </View>
             ))}
+
+            <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: 16, marginTop: 24, marginBottom: 12 }}>Payouts</Text>
+            {payouts.length === 0 ? (
+              <RaidexEmptyState
+                testID="payouts-empty"
+                icon="cash-outline"
+                title="No payouts yet"
+                subtitle="Payouts are created automatically when a trip completes."
+              />
+            ) : (
+              payouts.map((p, i) => <PayoutRow key={p.payout_id} p={p} index={i} />)
+            )}
           </View>
         )}
 
         {tab === "listings" && (
           <View>
-            {vehicles.length === 0 ? <EmptyState c={c} icon="car-outline" text="No vehicles yet — tap '+ Vehicle' to add one" /> :
-              vehicles.map((v) => (
-                <View key={v.vehicle_id} style={[styles.vRow, { backgroundColor: c.surface2, borderColor: c.border }]}>
-                  <Image source={v.hero_image || v.image} style={{ width: 70, height: 70, borderRadius: 10 }} contentFit="cover" />
-                  <View style={{ flex: 1 }}>
-                    <Text style={{ color: c.onSurface, fontWeight: "800" }}>{v.name}</Text>
-                    <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }}>
-                      <View style={{ paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, backgroundColor: v.verification_status === "approved" ? c.accentBg : c.surface3 }}>
-                        <Text style={{ color: v.verification_status === "approved" ? c.onAccentBg : c.onSurface2, fontSize: 10, fontWeight: "800", textTransform: "uppercase" }}>{v.verification_status}</Text>
+            {vehicles.length === 0 ? (
+              <RaidexEmptyState
+                testID="vehicles-empty"
+                icon="car-outline"
+                title="No vehicles yet"
+                subtitle="Add your first car or bike to start earning."
+                actionLabel="+ Add vehicle"
+                onAction={() => setTab("add")}
+              />
+            ) : (
+              vehicles.map((v, i) => (
+                <Reveal key={v.vehicle_id} index={i}>
+                  <RaidexCard variant="flat" style={{ marginBottom: tokens.spacing.sm }}>
+                    <View style={{ flexDirection: "row", gap: 12 }}>
+                      <Image source={v.hero_image || v.image} style={{ width: 70, height: 70, borderRadius: tokens.radius.md }} contentFit="cover" />
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold }}>{v.name}</Text>
+                        <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: 6 }}>
+                          <RaidexStatusPill status={v.verification_status} />
+                          <Text style={{ color: c.onSurface3, fontSize: 12 }}>· ₹{v.price_per_day}/day</Text>
+                        </View>
+                        <Text style={{ color: c.onSurface3, fontSize: 11, marginTop: 6 }}>{v.lifetime_km || 0} km lifetime · {v.trips || 0} trips</Text>
                       </View>
-                      <Text style={{ color: c.onSurface3, fontSize: 12 }}>· ₹{v.price_per_day}/day</Text>
                     </View>
-                    <Text style={{ color: c.onSurface3, fontSize: 11, marginTop: 4 }}>{v.lifetime_km || 0} km lifetime · {v.trips || 0} trips</Text>
-                  </View>
-                </View>
+                    {milestoneThresholds.length > 0 && (
+                      <ServiceMilestoneProgress
+                        lifetimeKm={v.lifetime_km || 0}
+                        thresholds={milestoneThresholds}
+                        benefits={serviceBenefits.filter((b) => b.vehicle_id === v.vehicle_id)}
+                      />
+                    )}
+                  </RaidexCard>
+                </Reveal>
               ))
-            }
+            )}
           </View>
         )}
 
         {tab === "bookings" && (
           <View>
-            {bookings.length === 0 ? <EmptyState c={c} icon="calendar-outline" text="No bookings on your vehicles yet" /> :
-              bookings.map((b) => (
-                <View key={b.booking_id} style={[styles.vRow, { backgroundColor: c.surface2, borderColor: c.border }]}>
-                  <Image source={b.vehicle_snapshot?.image} style={{ width: 60, height: 60, borderRadius: 10 }} contentFit="cover" />
-                  <View style={{ flex: 1 }}>
-                    <Text style={{ color: c.onSurface, fontWeight: "700" }}>{b.vehicle_snapshot?.name}</Text>
-                    <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 2 }}>{new Date(b.start_date).toLocaleDateString()} → {new Date(b.end_date).toLocaleDateString()}</Text>
-                    <Text style={{ color: c.onSurface, fontWeight: "800", marginTop: 4 }}>₹{b.total_amount.toLocaleString()} · <Text style={{ color: c.accent, fontSize: 11 }}>{b.status.toUpperCase()}</Text></Text>
-                  </View>
-                </View>
+            {bookings.length === 0 ? (
+              <RaidexEmptyState testID="bookings-empty" icon="calendar-outline" title="No bookings yet" subtitle="Bookings on your vehicles will show up here." />
+            ) : (
+              bookings.map((b, i) => (
+                <Reveal key={b.booking_id} index={i}>
+                  <RaidexCard variant="flat" style={{ marginBottom: tokens.spacing.sm }}>
+                    <View style={{ flexDirection: "row", gap: 12 }}>
+                      <Image source={b.vehicle_snapshot?.image} style={{ width: 60, height: 60, borderRadius: tokens.radius.md }} contentFit="cover" />
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ color: c.onSurface, fontWeight: tokens.weight.semibold }}>{b.vehicle_snapshot?.name}</Text>
+                        <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 2 }}>{new Date(b.start_date).toLocaleDateString()} → {new Date(b.end_date).toLocaleDateString()}</Text>
+                        <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: 6 }}>
+                          <Text style={{ color: c.onSurface, fontWeight: tokens.weight.black }}>₹{b.total_amount.toLocaleString()}</Text>
+                          <RaidexStatusPill status={b.status} />
+                        </View>
+                      </View>
+                    </View>
+                  </RaidexCard>
+                </Reveal>
               ))
-            }
+            )}
           </View>
         )}
 
-        {tab === "add" && <AddVehicleForm c={c} onCreated={() => { setTab("listings"); load(); }} />}
+        {tab === "add" && <AddVehicleForm onCreated={() => { setTab("listings"); load(); }} />}
       </ScrollView>
     </View>
   );
 }
 
-function AddVehicleForm({ c, onCreated }: any) {
+// Shared entrance-stagger wrapper - same Reanimated technique as
+// RaidexVehicleCard (index-based delay + fade/rise), reused here for
+// payout/vehicle/booking rows so lists never just pop onto the screen.
+function Reveal({ index = 0, children }: { index?: number; children: React.ReactNode }) {
+  const appear = useSharedValue(0);
+
+  useEffect(() => {
+    appear.value = withDelay(Math.min(index, 6) * 40, withTiming(1, { duration: tokens.motion.base, easing: Easing.out(Easing.cubic) }));
+  }, [appear, index]);
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    opacity: appear.value,
+    transform: [{ translateY: (1 - appear.value) * 14 }],
+  }));
+
+  return <Animated.View style={animatedStyle}>{children}</Animated.View>;
+}
+
+// One row of the "Gross − commission = Net" flow inside the dark earnings
+// hero card - keeps the financial hierarchy readable as a simple sequence
+// instead of three disconnected numbers (per brief: prefer clean hierarchy
+// over a chart).
+function FlowRow({ label, value, negative, strong }: { label: string; value: string; negative?: boolean; strong?: boolean }) {
+  return (
+    <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+      <Text style={{ color: strong ? "#fff" : "rgba(255,255,255,0.7)", fontSize: strong ? 15 : 13, fontWeight: strong ? tokens.weight.bold : tokens.weight.medium }}>
+        {label}
+      </Text>
+      <Text style={{ color: negative ? "#FCA5A5" : "#fff", fontSize: strong ? 16 : 13, fontWeight: strong ? tokens.weight.black : tokens.weight.semibold }}>
+        {value}
+      </Text>
+    </View>
+  );
+}
+
+function PayoutRow({ p, index }: { p: any; index: number }) {
+  const c = useTheme();
+  return (
+    <Reveal index={index}>
+      <RaidexCard variant="flat" style={{ marginBottom: tokens.spacing.sm }} testID={`payout-row-${p.payout_id}`}>
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <View style={{ flex: 1, marginRight: 8 }}>
+            <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: tokens.type.lg }}>₹{p.net_amount.toLocaleString()} net</Text>
+            <Text style={{ color: c.onSurface3, fontSize: 11, marginTop: 2 }}>
+              {p.booking_id ? `Booking ${p.booking_id}` : `Subscription ${p.subscription_id}`} · Gross ₹{p.gross_amount.toLocaleString()} · Commission ₹{p.commission_amount.toLocaleString()}
+              {p.commission_rate != null ? ` (${Math.round(p.commission_rate * 100)}%)` : ""}
+            </Text>
+          </View>
+          <RaidexStatusPill status={p.status} />
+        </View>
+        <PayoutStatusTrack status={p.status} />
+      </RaidexCard>
+    </Reveal>
+  );
+}
+
+// Compact "Pending → Eligible → Processing → Paid" progress track so a
+// payout's stage is visually obvious at a glance, not just a status word.
+// A terminal negative status (failed/cancelled/disputed) replaces the track
+// entirely rather than pretending it's still progressing.
+function PayoutStatusTrack({ status }: { status: string }) {
+  const c = useTheme();
+  if (PAYOUT_TERMINAL_NEGATIVE.includes(status)) return null;
+
+  const idx = Math.max(0, PAYOUT_STEPS.indexOf(status as any));
+  return (
+    <View style={{ flexDirection: "row", alignItems: "flex-start", marginTop: 12 }}>
+      {PAYOUT_STEPS.map((step, i) => (
+        <React.Fragment key={step}>
+          <View style={{ alignItems: "center", width: 54 }}>
+            <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: i <= idx ? c.accent : c.surface3 }} />
+            <Text
+              numberOfLines={1}
+              style={{ fontSize: 9, color: i <= idx ? c.onSurface2 : c.onSurface3, marginTop: 4, fontWeight: tokens.weight.semibold, textTransform: "capitalize" }}
+            >
+              {step}
+            </Text>
+          </View>
+          {i < PAYOUT_STEPS.length - 1 && (
+            <View style={{ flex: 1, height: 2, marginTop: 3, marginHorizontal: -2, backgroundColor: i < idx ? c.accent : c.surface3 }} />
+          )}
+        </React.Fragment>
+      ))}
+    </View>
+  );
+}
+
+// Signature RAIDEX differentiator: current platform mileage -> next service
+// milestone -> any benefits already earned for this specific vehicle. Real
+// data only - thresholds from GET /service-milestones/config, benefits from
+// GET /owner/service-benefits, lifetime_km already on the vehicle record.
+function ServiceMilestoneProgress({ lifetimeKm, thresholds, benefits }: { lifetimeKm: number; thresholds: number[]; benefits: any[] }) {
+  const c = useTheme();
+  const sorted = [...thresholds].sort((a, b) => a - b);
+  const nextThreshold = sorted.find((t) => t > lifetimeKm);
+  const prevThreshold = [...sorted].reverse().find((t) => t <= lifetimeKm) ?? 0;
+  const pct = nextThreshold
+    ? Math.min(100, Math.max(0, ((lifetimeKm - prevThreshold) / (nextThreshold - prevThreshold)) * 100))
+    : 100;
+  const width = useSharedValue(0);
+  useEffect(() => { width.value = withTiming(pct, { duration: tokens.motion.slow }); }, [pct, width]);
+  const barStyle = useAnimatedStyle(() => ({ width: `${width.value}%` }));
+
+  return (
+    <View style={{ marginTop: tokens.spacing.md, paddingTop: tokens.spacing.md, borderTopWidth: 1, borderTopColor: c.border }}>
+      <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+        <Text style={{ color: c.onSurface2, fontSize: 11, fontWeight: tokens.weight.bold, letterSpacing: 0.5 }}>SERVICE MILESTONE</Text>
+        <Text style={{ color: c.onSurface3, fontSize: 11, fontWeight: tokens.weight.medium }}>
+          {nextThreshold ? `${lifetimeKm.toLocaleString()} / ${nextThreshold.toLocaleString()} km` : `${lifetimeKm.toLocaleString()} km`}
+        </Text>
+      </View>
+      <View style={{ height: 6, borderRadius: 999, backgroundColor: c.surface3, marginTop: 8, overflow: "hidden" }}>
+        <Animated.View style={[{ height: "100%", backgroundColor: c.accent, borderRadius: 999 }, barStyle]} />
+      </View>
+      {benefits.length > 0 && (
+        <View style={{ marginTop: tokens.spacing.sm, gap: 6 }}>
+          {benefits.map((b) => (
+            <View key={b.benefit_id} style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+              <Text style={{ color: c.onSurface2, fontSize: 12 }}>{b.milestone_km.toLocaleString()} km benefit</Text>
+              <RaidexStatusPill status={b.status} />
+            </View>
+          ))}
+        </View>
+      )}
+    </View>
+  );
+}
+
+function AddVehicleForm({ onCreated }: { onCreated: () => void }) {
+  const c = useTheme();
   const [form, setForm] = useState({
     type: "car", name: "", brand: "", model: "",
     image: "https://images.unsplash.com/photo-1758217209786-95458c5d30a7?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjY2NjV8MHwxfHNlYXJjaHwzfHxsdXh1cnklMjBTVVYlMjBkcml2aW5nfGVufDB8fHx8MTc4MTk3MTYwMnww&ixlib=rb-4.1.0&q=85",
@@ -195,13 +405,11 @@ function AddVehicleForm({ c, onCreated }: any) {
   };
   return (
     <View>
-      <Text style={{ color: c.onSurface, fontWeight: "800", fontSize: 16, marginBottom: 12 }}>New vehicle</Text>
-      <Text style={[styles.lbl, { color: c.onSurface2 }]}>Type</Text>
-      <View style={{ flexDirection: "row", gap: 8, marginBottom: 12 }}>
+      <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: 16, marginBottom: 12 }}>New vehicle</Text>
+      <Text style={{ color: c.onSurface2, fontSize: tokens.type.sm, fontWeight: tokens.weight.bold, marginBottom: 7 }}>Type</Text>
+      <View style={{ flexDirection: "row", gap: 8, marginBottom: tokens.spacing.md }}>
         {["car", "bike"].map((t) => (
-          <Pressable key={t} testID={`type-${t}`} onPress={() => setForm({ ...form, type: t })} style={[styles.chip, { backgroundColor: form.type === t ? c.inverse : c.surface2, borderColor: form.type === t ? c.inverse : c.border }]}>
-            <Text style={{ color: form.type === t ? c.onInverse : c.onSurface, fontWeight: "700", textTransform: "capitalize" }}>{t}</Text>
-          </Pressable>
+          <RaidexChip key={t} testID={`type-${t}`} label={t.charAt(0).toUpperCase() + t.slice(1)} active={form.type === t} onPress={() => setForm({ ...form, type: t })} />
         ))}
       </View>
       {[
@@ -214,49 +422,22 @@ function AddVehicleForm({ c, onCreated }: any) {
         ["seats", "Seats", "5"],
         ["location", "City / Location", "Mumbai"],
       ].map(([k, lbl, ph]) => (
-        <View key={k} style={{ marginBottom: 12 }}>
-          <Text style={[styles.lbl, { color: c.onSurface2 }]}>{lbl}</Text>
-          <TextInput
-            testID={`form-${k}`}
-            value={(form as any)[k]}
-            onChangeText={(t) => setForm({ ...form, [k]: t })}
-            placeholder={ph as string}
-            placeholderTextColor={c.onSurface3}
-            keyboardType={k.startsWith("price") || k === "deposit" || k === "seats" ? "numeric" : "default"}
-            style={[styles.input, { backgroundColor: c.surface2, borderColor: c.border, color: c.onSurface }]}
-          />
-        </View>
+        <RaidexInput
+          key={k}
+          testID={`form-${k}`}
+          label={lbl}
+          value={(form as any)[k]}
+          onChangeText={(t) => setForm({ ...form, [k]: t })}
+          placeholder={ph as string}
+          keyboardType={k.startsWith("price") || k === "deposit" || k === "seats" ? "numeric" : "default"}
+        />
       ))}
-      <Pressable testID="create-vehicle-btn" disabled={busy} onPress={submit} style={[styles.cta, { backgroundColor: c.inverse, marginTop: 12, opacity: busy ? 0.6 : 1 }]}>
-        {busy ? <ActivityIndicator color={c.onInverse} /> : <Text style={{ color: c.onInverse, fontWeight: "800" }}>Submit for review</Text>}
-      </Pressable>
-    </View>
-  );
-}
-
-function Kpi({ c, label, val }: any) {
-  return (
-    <View style={{ flex: 1, padding: 14, borderRadius: 14, backgroundColor: c.surface2, borderWidth: 1, borderColor: c.border }}>
-      <Text style={{ color: c.onSurface3, fontSize: 10, fontWeight: "700", letterSpacing: 1 }}>{label.toUpperCase()}</Text>
-      <Text style={{ color: c.onSurface, fontSize: 22, fontWeight: "800", marginTop: 4 }}>{val}</Text>
-    </View>
-  );
-}
-function EmptyState({ c, icon, text }: any) {
-  return (
-    <View style={{ alignItems: "center", padding: 40 }}>
-      <Ionicons name={icon} size={48} color={c.onSurface3} />
-      <Text style={{ color: c.onSurface2, marginTop: 12 }}>{text}</Text>
+      <RaidexButton testID="create-vehicle-btn" label="Submit for review" onPress={submit} loading={busy} disabled={busy} style={{ marginTop: 4 }} />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  cta: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, paddingVertical: 16, borderRadius: 14 },
   row: { flexDirection: "row", alignItems: "center", gap: 12, padding: 14, borderRadius: 14, borderWidth: 1 },
   iconRound: { width: 36, height: 36, borderRadius: 999, alignItems: "center", justifyContent: "center" },
-  chip: { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 999, borderWidth: 1, height: 36, flexShrink: 0, alignItems: "center", justifyContent: "center" },
-  vRow: { flexDirection: "row", gap: 12, padding: 12, borderRadius: 14, borderWidth: 1, marginBottom: 8 },
-  lbl: { fontSize: 12, fontWeight: "600", marginBottom: 6 },
-  input: { borderWidth: 1, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 12, fontSize: 15 },
 });

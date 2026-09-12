@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  ActivityIndicator, Alert, FlatList, Platform, Pressable, RefreshControl, ScrollView,
+  Alert, FlatList, Pressable, RefreshControl, ScrollView,
   StyleSheet, Text, TextInput, View,
 } from "react-native";
 import { Image } from "expo-image";
@@ -8,11 +8,13 @@ import { Ionicons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
-import { WebView } from "react-native-webview";
+import Animated, { useAnimatedStyle, useSharedValue, withTiming } from "react-native-reanimated";
 
 import { api } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { tokens, useTheme } from "@/src/theme";
+import { MapCanvas } from "@/src/features/maps/MapView";
+import { RaidexChip, RaidexEmptyState, RaidexErrorState, RaidexSkeleton, RaidexVehicleCard } from "@/src/components/ui";
 
 type Vehicle = {
   vehicle_id: string;
@@ -139,10 +141,10 @@ export default function HomeScreen() {
               </Text>
             </View>
             <View style={styles.headerActions}>
-              <View style={[styles.pill, { backgroundColor: c.accentBg }]}>
+              <Pressable testID="ride-miles-pill" onPress={() => router.push("/(tabs)/rewards" as any)} style={[styles.pill, { backgroundColor: c.accentBg }]}>
                 <Ionicons name="star" size={12} color={c.onAccentBg} />
                 <Text style={{ color: c.onAccentBg, fontWeight: "700", fontSize: 12 }}>{user?.ride_miles ?? 0}</Text>
-              </View>
+              </Pressable>
               <Pressable testID="notif-btn" onPress={() => router.push("/notifications")}>
                 <Ionicons name="notifications-outline" size={24} color={c.onSurface} />
               </Pressable>
@@ -181,12 +183,16 @@ export default function HomeScreen() {
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chipScroller} style={{ height: 56 }}>
           {CATS.map((it) => {
             const active = cat === it.key;
+            const isNav = it.key === "subscription" || it.key === "swap";
             return (
-              <Pressable key={it.key} testID={`chip-${it.key}`} onPress={() => setCat(it.key)}
-                style={[styles.chip, { backgroundColor: active ? c.inverse : c.surface2, borderColor: active ? c.inverse : c.border }]}>
-                <Ionicons name={it.icon} size={14} color={active ? c.onInverse : c.onSurface2} />
-                <Text style={{ color: active ? c.onInverse : c.onSurface, fontWeight: "600", fontSize: 13 }}>{it.label}</Text>
-              </Pressable>
+              <RaidexChip
+                key={it.key}
+                testID={`chip-${it.key}`}
+                label={it.label}
+                icon={it.icon}
+                active={active}
+                onPress={() => (isNav ? router.push("/subscriptions") : setCat(it.key))}
+              />
             );
           })}
         </ScrollView>
@@ -225,82 +231,41 @@ export default function HomeScreen() {
                   </Pressable>
                 </View>
               )}
-              <LinearGradient colors={["#000", "#1a1a1a"]} style={styles.pointsCard}>
-                <Text style={styles.pointsEyebrow}>RIDEX POINTS</Text>
-                <Text style={styles.pointsTier}>{user?.tier ?? "Silver"}</Text>
-                <Text style={styles.pointsCopy}>{user?.ride_miles ?? 0} points. Earn on rentals, referrals, reviews, and on-time returns.</Text>
-                <View style={styles.progressTrack}>
-                  <View style={{ width: `${Math.min(100, ((user?.ride_miles ?? 0) / 1000) * 100)}%`, height: "100%", backgroundColor: "#05C46B" }} />
-                </View>
-              </LinearGradient>
+              <Pressable testID="ride-miles-card" onPress={() => router.push("/(tabs)/rewards" as any)}>
+                <LinearGradient colors={["#000", "#1a1a1a"]} style={styles.pointsCard}>
+                  <Text style={styles.pointsEyebrow}>RIDEX POINTS</Text>
+                  <Text style={styles.pointsTier}>{user?.tier ?? "Silver"}</Text>
+                  <Text style={styles.pointsCopy}>{user?.ride_miles ?? 0} points. Earn on rentals, referrals, reviews, and on-time returns.</Text>
+                  <RideMilesProgressBar targetPct={Math.min(100, ((user?.ride_miles ?? 0) / 1000) * 100)} />
+                </LinearGradient>
+              </Pressable>
             </View>
           }
           ListEmptyComponent={
-            <View style={{ alignItems: "center", padding: 40 }}>
-              <Ionicons name={error ? "cloud-offline-outline" : "car-outline"} size={48} color={c.onSurface3} />
-              <Text style={{ color: c.onSurface2, marginTop: 12, fontSize: 16, fontWeight: "700", textAlign: "center" }}>
-                {error ? "Could not load vehicles" : "No vehicles found"}
-              </Text>
-              <Text style={{ color: c.onSurface3, marginTop: 6, textAlign: "center" }}>{error || "Try another search or filter."}</Text>
-              {error && (
-                <Pressable onPress={fetchData} style={[styles.retryBtn, { backgroundColor: c.inverse }]}>
-                  <Text style={{ color: c.onInverse, fontWeight: "800" }}>Retry</Text>
-                </Pressable>
-              )}
-            </View>
+            error ? (
+              <RaidexErrorState message={error} onRetry={fetchData} testID="discovery-error-state" />
+            ) : (
+              <RaidexEmptyState
+                icon="car-outline"
+                title="No vehicles found"
+                subtitle="Try another search or filter."
+                testID="discovery-empty-state"
+              />
+            )
           }
-          renderItem={({ item }) => (
-            <Pressable testID={`vehicle-card-${item.vehicle_id}`} onPress={() => router.push(`/vehicle/${item.vehicle_id}`)}
-              style={[styles.card, { backgroundColor: c.surface2, borderColor: c.border }]}>
-              <Image source={item.image} style={styles.cardImg} contentFit="cover" />
-              <View style={{ padding: tokens.spacing.lg }}>
-                <View style={styles.cardTop}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={{ color: c.onSurface, fontSize: tokens.type.lg, fontWeight: "800" }} numberOfLines={1}>{item.name}</Text>
-                    <Text style={{ color: c.onSurface3, fontSize: tokens.type.sm, marginTop: 2 }}>{item.location}</Text>
-                  </View>
-                  <View style={[styles.ratingPill, { backgroundColor: c.surface }]}>
-                    <Ionicons name="star" size={12} color="#F59E0B" />
-                    <Text style={{ color: c.onSurface, fontWeight: "800", fontSize: 12 }}>{item.rating.toFixed(1)}</Text>
-                  </View>
-                </View>
-                <View style={styles.tags}>
-                  <Tag c={c} icon="people" text={String(item.seats)} />
-                  <Tag c={c} icon="speedometer" text={item.transmission} />
-                  <Tag c={c} icon="flash" text={item.fuel_type} />
-                  <Tag c={c} icon="location" text={`${item.distance_km} km`} />
-                  <Tag c={c} icon="shield-checkmark" text={`${item.trust_score ?? 92} trust`} />
-                  {item.instant_book !== false && <Tag c={c} icon="flash-outline" text="Instant" />}
-                </View>
-                <View style={[styles.cardFooter, { borderTopColor: c.border }]}>
-                  <View>
-                    <Text style={{ color: c.onSurface3, fontSize: 11 }}>per day</Text>
-                    <Text style={{ color: c.onSurface, fontSize: 20, fontWeight: "900" }}>Rs {item.price_per_day.toLocaleString()}</Text>
-                  </View>
-                  <View style={[styles.bookBtn, { backgroundColor: c.inverse }]}>
-                    <Text style={{ color: c.onInverse, fontWeight: "800" }}>View</Text>
-                    <Ionicons name="arrow-forward" size={14} color={c.onInverse} />
-                  </View>
-                </View>
-                <Pressable testID={`compare-${item.vehicle_id}`} onPress={() => toggleCompare(item.vehicle_id)}
-                  style={[styles.compareSelect, { borderColor: compareIds.includes(item.vehicle_id) ? c.accent : c.border }]}>
-                  <Ionicons name={compareIds.includes(item.vehicle_id) ? "checkbox" : "square-outline"} size={16} color={compareIds.includes(item.vehicle_id) ? c.accent : c.onSurface3} />
-                  <Text style={{ color: c.onSurface2, fontWeight: "700", fontSize: 12 }}>Compare</Text>
-                </Pressable>
-              </View>
-            </Pressable>
+          renderItem={({ item, index }) => (
+            <RaidexVehicleCard
+              testID={`vehicle-card-${item.vehicle_id}`}
+              vehicle={item}
+              index={index}
+              onPress={() => router.push(`/vehicle/${item.vehicle_id}`)}
+              selected={compareIds.includes(item.vehicle_id)}
+              onToggleSelect={() => toggleCompare(item.vehicle_id)}
+              selectLabel="Compare"
+            />
           )}
         />
       )}
-    </View>
-  );
-}
-
-function Tag({ c, icon, text }: { c: any; icon: any; text: string }) {
-  return (
-    <View style={{ flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: c.surface, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4, borderWidth: 1, borderColor: c.border }}>
-      <Ionicons name={icon} size={11} color={c.onSurface2} />
-      <Text style={{ color: c.onSurface2, fontSize: 11, fontWeight: "700" }}>{text}</Text>
     </View>
   );
 }
@@ -369,7 +334,7 @@ function PremiumNearbyMap({ c, items, onRefresh, onSelect }: any) {
         </View>
       </LinearGradient>
 
-      <PremiumMapCanvas c={c} items={visibleItems} centerLat={centerLat} centerLng={centerLng} selectedId={selected?.vehicle_id} onSelect={setSelectedId} />
+      <MapCanvas c={c} items={visibleItems} centerLat={centerLat} centerLng={centerLng} selectedId={selected?.vehicle_id} onSelect={setSelectedId} height={220} />
 
       {selected ? (
         <Pressable testID="selected-map-vehicle" onPress={() => onSelect(selected.vehicle_id)}
@@ -398,174 +363,6 @@ function PremiumNearbyMap({ c, items, onRefresh, onSelect }: any) {
       ) : null}
     </View>
   );
-}
-
-function PremiumMapCanvas({ c, items, centerLat, centerLng, selectedId, onSelect }: any) {
-  return (
-    <LinearGradient colors={["#111827", "#0F172A", "#13251B"]} style={styles.premiumMapCanvas}>
-      <View style={styles.mapRoadA} />
-      <View style={styles.mapRoadB} />
-      <View style={styles.mapRoadC} />
-      <View style={styles.userRange} />
-      <View style={styles.userLocator}>
-        <View style={styles.userPulse} />
-        <Ionicons name="navigate" size={16} color="#fff" />
-      </View>
-      {items.slice(0, 24).map((item: Vehicle, index: number) => {
-        const left = Math.max(8, Math.min(84, 50 + (item.longitude - centerLng) * 900 + ((index % 3) - 1) * 5));
-        const top = Math.max(12, Math.min(78, 50 - (item.latitude - centerLat) * 1300 + ((index % 4) - 1.5) * 4));
-        const active = item.vehicle_id === selectedId;
-        return (
-          <Pressable key={item.vehicle_id} testID={`map-pin-${item.vehicle_id}`} onPress={() => onSelect(item.vehicle_id)}
-            style={[styles.ridePin, { left: `${left}%`, top: `${top}%`, backgroundColor: active ? "#05C46B" : "#fff", transform: [{ scale: active ? 1.08 : 1 }] }]}>
-            <Ionicons name={item.type === "bike" ? "bicycle" : "car-sport"} size={13} color={active ? "#fff" : "#050505"} />
-            <Text style={{ color: active ? "#fff" : "#050505", fontWeight: "900", fontSize: 10 }}>Rs {Math.round(item.price_per_day / 1000)}k</Text>
-          </Pressable>
-        );
-      })}
-      <View style={styles.mapLegend}>
-        <View style={styles.liveDotSmall} />
-        <Text style={styles.mapLegendText}>Live availability</Text>
-      </View>
-      <View style={styles.demandBadge}>
-        <Ionicons name="flash" size={13} color="#050505" />
-        <Text style={styles.demandText}>High demand zone</Text>
-      </View>
-    </LinearGradient>
-  );
-}
-
-function NearbyMap({ c, items, onRefresh, onSelect }: any) {
-  const [mapFailed, setMapFailed] = useState(false);
-  const centerLat = items.length ? items.reduce((sum: number, v: Vehicle) => sum + v.latitude, 0) / items.length : 19.076;
-  const centerLng = items.length ? items.reduce((sum: number, v: Vehicle) => sum + v.longitude, 0) / items.length : 72.8777;
-  const html = useMemo(() => mapLibreHtml(items.slice(0, 60), centerLat, centerLng), [items, centerLat, centerLng]);
-  return (
-    <View style={[styles.mapWrap, { backgroundColor: c.surface2, borderColor: c.border }]}>
-      <View style={styles.mapHeader}>
-        <View>
-          <Text style={{ color: c.onSurface, fontSize: 18, fontWeight: "900" }}>MapLibre discovery</Text>
-          <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 2 }}>Free OpenStreetMap tiles with live vehicle markers</Text>
-        </View>
-        <Pressable testID="map-refresh" onPress={onRefresh} style={[styles.mapRefresh, { backgroundColor: c.surface }]}>
-          <Ionicons name="refresh" size={18} color={c.onSurface} />
-        </Pressable>
-      </View>
-      {Platform.OS === "web" || mapFailed ? (
-        <FallbackMap c={c} items={items} centerLat={centerLat} centerLng={centerLng} onSelect={onSelect} />
-      ) : (
-        <WebView
-          testID="maplibre-webview"
-          originWhitelist={["*"]}
-          source={{ html }}
-          style={styles.mapCanvas}
-          javaScriptEnabled
-          domStorageEnabled
-          scrollEnabled={false}
-          onError={() => setMapFailed(true)}
-          onHttpError={() => setMapFailed(true)}
-          onMessage={(event) => {
-            const vehicleId = event.nativeEvent.data;
-            if (vehicleId === "__MAP_FAILED__") {
-              setMapFailed(true);
-              return;
-            }
-            if (vehicleId) onSelect(vehicleId);
-          }}
-        />
-      )}
-    </View>
-  );
-}
-
-function mapLibreHtml(items: Vehicle[], centerLat: number, centerLng: number) {
-  const safeItems = JSON.stringify(items.map((item) => ({
-    id: item.vehicle_id,
-    type: item.type,
-    name: item.name,
-    price: item.price_per_day,
-    rating: item.rating,
-    distance: item.distance_km,
-    available: item.available !== false,
-    lat: Number(item.latitude),
-    lng: Number(item.longitude),
-  }))).replace(/</g, "\\u003c");
-
-  return `<!doctype html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
-  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
-  <style>
-    html, body, #map { height: 100%; margin: 0; overflow: hidden; background: #eef2f0; }
-    .marker {
-      border: 2px solid #fff;
-      border-radius: 999px;
-      box-shadow: 0 8px 20px rgba(0,0,0,.22);
-      color: #fff;
-      cursor: pointer;
-      font: 800 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      padding: 6px 8px;
-      white-space: nowrap;
-    }
-    .marker.available { background: #050505; }
-    .marker.unavailable { background: #777; }
-    .user-dot {
-      width: 18px;
-      height: 18px;
-      border-radius: 999px;
-      background: #05C46B;
-      border: 3px solid #fff;
-      box-shadow: 0 0 0 9px rgba(5,196,107,.18);
-    }
-  </style>
-</head>
-<body>
-  <div id="map"></div>
-  <script>
-    window.onerror = () => window.ReactNativeWebView?.postMessage("__MAP_FAILED__");
-    setTimeout(() => {
-      if (!window.maplibregl) window.ReactNativeWebView?.postMessage("__MAP_FAILED__");
-    }, 3500);
-    const vehicles = ${safeItems};
-    const center = [${Number(centerLng).toFixed(6)}, ${Number(centerLat).toFixed(6)}];
-    const map = new maplibregl.Map({
-      container: "map",
-      center,
-      zoom: 11,
-      attributionControl: false,
-      style: {
-        version: 8,
-        sources: {
-          osm: {
-            type: "raster",
-            tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-            tileSize: 256,
-            attribution: "OpenStreetMap"
-          }
-        },
-        layers: [{ id: "osm", type: "raster", source: "osm" }]
-      }
-    });
-    map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
-    const userDot = document.createElement("div");
-    userDot.className = "user-dot";
-    new maplibregl.Marker({ element: userDot }).setLngLat(center).addTo(map);
-    vehicles.forEach((vehicle) => {
-      if (!Number.isFinite(vehicle.lat) || !Number.isFinite(vehicle.lng)) return;
-      const el = document.createElement("button");
-      el.className = "marker " + (vehicle.available ? "available" : "unavailable");
-      el.textContent = (vehicle.type === "bike" ? "B" : "C") + " · " + Math.round(vehicle.price / 1000) + "k";
-      el.onclick = () => window.ReactNativeWebView?.postMessage(vehicle.id);
-      const popup = new maplibregl.Popup({ offset: 18 }).setHTML(
-        "<strong>" + vehicle.name + "</strong><br/>Rs " + vehicle.price + "/day · " + vehicle.rating.toFixed(1) + " rating · " + vehicle.distance + " km"
-      );
-      new maplibregl.Marker({ element: el }).setLngLat([vehicle.lng, vehicle.lat]).setPopup(popup).addTo(map);
-    });
-  </script>
-</body>
-</html>`;
 }
 
 function NoMapDiscovery({ c, items, onRefresh }: any) {
@@ -603,22 +400,13 @@ function StatTile({ c, icon, label, value }: any) {
   );
 }
 
-function FallbackMap({ c, items, centerLat, centerLng, onSelect }: any) {
+function RideMilesProgressBar({ targetPct }: { targetPct: number }) {
+  const width = useSharedValue(0);
+  useEffect(() => { width.value = withTiming(targetPct, { duration: tokens.motion.slow }); }, [targetPct, width]);
+  const animatedStyle = useAnimatedStyle(() => ({ width: `${width.value}%` }));
   return (
-    <View style={[styles.mapCanvas, { backgroundColor: c.surface }]}>
-      {Array.from({ length: 5 }).map((_, i) => <View key={`h${i}`} style={[styles.mapGridH, { top: `${(i + 1) * 16}%`, backgroundColor: c.border }]} />)}
-      {Array.from({ length: 5 }).map((_, i) => <View key={`v${i}`} style={[styles.mapGridV, { left: `${(i + 1) * 16}%`, backgroundColor: c.border }]} />)}
-      <View style={[styles.userDot, { backgroundColor: c.accent }]} />
-      {items.slice(0, 18).map((item: Vehicle) => {
-        const left = Math.max(8, Math.min(88, 50 + (item.longitude - centerLng) * 900));
-        const top = Math.max(10, Math.min(82, 50 - (item.latitude - centerLat) * 1300));
-        return (
-          <Pressable key={item.vehicle_id} onPress={() => onSelect(item.vehicle_id)}
-            style={[styles.marker, { left: `${left}%`, top: `${top}%`, backgroundColor: item.available === false ? c.surface3 : c.inverse }]}>
-            <Ionicons name={item.type === "bike" ? "bicycle" : "car-sport"} size={14} color={item.available === false ? c.onSurface3 : c.onInverse} />
-          </Pressable>
-        );
-      })}
+    <View style={styles.progressTrack}>
+      <Animated.View style={[{ height: "100%", backgroundColor: "#05C46B", borderRadius: 999 }, animatedStyle]} />
     </View>
   );
 }
@@ -626,9 +414,10 @@ function FallbackMap({ c, items, centerLat, centerLng, onSelect }: any) {
 function DiscoverySkeleton({ c }: any) {
   return (
     <View style={{ padding: tokens.spacing.xl, gap: 14 }}>
-      <View style={[styles.skeletonMap, { backgroundColor: c.surface2 }]} />
-      <View style={[styles.skeletonLine, { backgroundColor: c.surface2, width: "70%" }]} />
-      <View style={[styles.skeletonCard, { backgroundColor: c.surface2 }]} />
+      <RaidexSkeleton height={260} radius={22} />
+      <RaidexSkeleton width="70%" height={18} />
+      <RaidexSkeleton height={270} radius={20} />
+      <RaidexSkeleton height={270} radius={20} />
     </View>
   );
 }
@@ -643,7 +432,6 @@ const styles = StyleSheet.create({
   chipScroller: { paddingHorizontal: tokens.spacing.xl, paddingVertical: tokens.spacing.sm, gap: 8 },
   filterScroller: { paddingHorizontal: tokens.spacing.xl, gap: 8, paddingBottom: tokens.spacing.md },
   filterPill: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 999, borderWidth: 1 },
-  chip: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 999, borderWidth: 1, height: 36, flexShrink: 0 },
   pill: { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
   modeSwitch: { flexDirection: "row", borderRadius: 16, borderWidth: 1, padding: 4 },
   modeButton: { flex: 1, height: 40, borderRadius: 12, alignItems: "center", justifyContent: "center", flexDirection: "row", gap: 7 },
@@ -689,16 +477,4 @@ const styles = StyleSheet.create({
   progressTrack: { height: 6, backgroundColor: "rgba(255,255,255,0.15)", borderRadius: 999, marginTop: 14, overflow: "hidden" },
   compareBar: { flexDirection: "row", alignItems: "center", gap: 10, borderRadius: 16, borderWidth: 1, padding: 12 },
   smallBtn: { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 999 },
-  card: { borderRadius: 20, borderWidth: 1, overflow: "hidden" },
-  cardImg: { width: "100%", height: 180 },
-  cardTop: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" },
-  tags: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 10 },
-  ratingPill: { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999 },
-  cardFooter: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: tokens.spacing.md, paddingTop: tokens.spacing.md, borderTopWidth: 1 },
-  bookBtn: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 16, paddingVertical: 10, borderRadius: 12 },
-  compareSelect: { flexDirection: "row", alignItems: "center", gap: 6, borderWidth: 1, alignSelf: "flex-start", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999, marginTop: 12 },
-  retryBtn: { paddingHorizontal: 18, paddingVertical: 10, borderRadius: 12, marginTop: 16 },
-  skeletonMap: { height: 260, borderRadius: 22 },
-  skeletonLine: { height: 18, borderRadius: 999 },
-  skeletonCard: { height: 270, borderRadius: 20 },
 });

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
+from pymongo.errors import OperationFailure
 
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "raidex_test")
@@ -61,11 +62,11 @@ class Collection:
     def find(self, query=None, projection=None):
         return Cursor([dict(d) for d in self.docs if matches(d, query or {})])
 
-    async def insert_one(self, doc):
+    async def insert_one(self, doc, session=None):
         self.inserted.append(doc)
         self.docs.append(doc)
 
-    async def update_one(self, query, update, upsert=False):
+    async def update_one(self, query, update, upsert=False, session=None):
         self.updated.append((query, update, upsert))
         doc = next((item for item in self.docs if matches(item, query)), None)
         if doc is None and upsert:
@@ -73,6 +74,15 @@ class Collection:
             self.docs.append(doc)
         if doc is not None:
             apply_update(doc, update)
+        return None
+
+    async def find_one_and_update(self, query, update, projection=None, return_document=False, session=None, **_kwargs):
+        for doc in self.docs:
+            if matches(doc, query):
+                before = dict(doc)
+                apply_update(doc, update)
+                self.updated.append((query, update, False))
+                return dict(doc) if return_document else before
         return None
 
     async def delete_one(self, query):
@@ -125,8 +135,17 @@ def apply_update(doc, update):
             doc.setdefault(key, value)
 
 
+class FakeMongoClient:
+    """Stand-in for AsyncIOMotorClient - this fake DB has no replica set, so
+    sessions/transactions aren't supported, matching a standalone dev mongod."""
+
+    async def start_session(self):
+        raise OperationFailure("Transactions are not supported by this fake test DB")
+
+
 class DB:
     def __init__(self):
+        self.client = FakeMongoClient()
         self.users = Collection([dict(USER)])
         self.vehicles = Collection()
         self.bookings = Collection()
@@ -154,21 +173,49 @@ class DB:
         self.geofence_events = Collection()
         self.gps_tracks = Collection()
         self.media_assets = Collection()
+        self.support_threads = Collection()
         self.support_messages = Collection()
+        self.agent_runs = Collection()
         self.wallet_ledger = Collection()
         self.ride_miles_ledger = Collection()
         self.device_sessions = Collection()
         self.revoked_tokens = Collection()
         self.user_sessions = Collection()
+        self.platform_config = Collection()
+        self.payouts = Collection()
+        self.service_milestones = Collection()
+        self.vehicle_service_progress = Collection()
+        self.service_benefits = Collection()
+        self.subscriptions = Collection()
+        self.vehicle_swaps = Collection()
+        self.job_notification_dedup = Collection()
+        self.payment_reconciliation_flags = Collection()
+        self.fraud_flags = Collection()
+        self.analytics_snapshots = Collection()
 
     async def command(self, *_args, **_kwargs):
         return {"ok": 1}
+
+
+class FakeGridFSBucket:
+    """Stand-in for AsyncIOMotorGridFSBucket - keeps uploaded bytes in memory."""
+
+    def __init__(self):
+        self.files = {}
+        self._next_id = 1
+
+    async def upload_from_stream(self, filename, data, **_kwargs):
+        file_id = f"fake_gridfs_{self._next_id}"
+        self._next_id += 1
+        self.files[file_id] = data
+        return file_id
 
 
 @pytest.fixture()
 def fake_db(monkeypatch):
     db = DB()
     monkeypatch.setattr(server, "db", db)
+    monkeypatch.setattr(server, "fs_bucket", FakeGridFSBucket())
     return db
 
 
@@ -387,5 +434,6 @@ async def test_trip_lifecycle_requires_inspections(fake_db):
 
 
 def test_haversine_distance_is_reasonable():
-    distance = server._haversine_m(28.6139, 77.2090, 28.7041, 77.1025)
+    from providers.gps_provider import haversine_m
+    distance = haversine_m(28.6139, 77.2090, 28.7041, 77.1025)
     assert 14000 < distance < 16000

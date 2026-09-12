@@ -117,7 +117,12 @@ async def test_kyc_success_failure_validation_unauthorized_and_provider_failure(
             raise RuntimeError("kyc provider down")
 
     monkeypatch.setattr(server, "get_kyc_provider", lambda: FailingKYC())
-    await server._run_kyc_verification(fake_db.kyc_submissions.docs[0]["kyc_id"], USER["user_id"], fake_db.kyc_submissions.docs[0])
+    raw_payload = {
+        "aadhaar_front": payload.aadhaar_front, "aadhaar_back": payload.aadhaar_back,
+        "aadhaar_last4": payload.aadhaar_last4, "dl_front": payload.dl_front, "dl_back": payload.dl_back,
+        "dl_number": payload.dl_number, "dl_expiry": payload.dl_expiry, "face_selfie": payload.face_selfie,
+    }
+    await server._run_kyc_verification(fake_db.kyc_submissions.docs[0]["kyc_id"], USER["user_id"], raw_payload)
     assert fake_db.kyc_submissions.docs[0]["status"] == "rejected"
 
 
@@ -201,6 +206,22 @@ async def test_payment_success_failure_validation_unauthorized_and_gateway_failu
     monkeypatch.setattr(server, "get_payment_gateway", lambda: DownGateway())
     with pytest.raises(RuntimeError):
         await server.payments_create(server.PaymentCreateRequest(amount=500, purpose="wallet_topup"), USER)
+
+
+@pytest.mark.asyncio
+async def test_payments_create_rejects_underpaying_a_booking(fake_db, monkeypatch):
+    # payload.amount was previously never checked against what the booking
+    # actually owes - a tampered client request could pay far less than the
+    # real total and still have the booking marked confirmed on success.
+    monkeypatch.setattr(server, "get_payment_gateway", lambda: Gateway())
+    fake_db.bookings.docs.append(booking_doc(status="pending_payment", total_amount=1000))
+    with pytest.raises(HTTPException) as exc:
+        await server.payments_create(server.PaymentCreateRequest(booking_id="bkg_1", amount=1, purpose="booking"), USER)
+    assert exc.value.status_code == 400
+
+    # Paying the full total (or more, e.g. bundling the deposit) is fine.
+    ok = await server.payments_create(server.PaymentCreateRequest(booking_id="bkg_1", amount=1000, purpose="booking"), USER)
+    assert ok["status"] == "created"
 
 
 @pytest.mark.asyncio

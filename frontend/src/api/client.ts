@@ -4,7 +4,7 @@
 import * as SecureStore from "expo-secure-store";
 import { Platform } from "react-native";
 import { captureError } from "../observability/sentry";
-import { enqueueRequest, getCached, isOnline, setCached } from "../utils/offline";
+import { clearQueue, enqueueRequest, getCached, getQueue, isOnline, setCached } from "../utils/offline";
 
 function backendUrl() {
   return process.env["EXPO_PUBLIC_BACKEND_URL"] || (process.env.NODE_ENV === "test" ? "https://api.raidex.test" : "");
@@ -45,7 +45,7 @@ export async function saveRefreshToken(token?: string | null) {
   }
 }
 
-async function getRefreshToken(): Promise<string | null> {
+export async function getRefreshToken(): Promise<string | null> {
   if (Platform.OS === "web") {
     try {
       return globalThis.localStorage?.getItem(REFRESH_KEY) ?? null;
@@ -159,6 +159,25 @@ export async function api<T = any>(
     await setCached(cacheKey, json);
   }
   return json;
+}
+
+/**
+ * Replay requests that were queued (via `queueOnFailure`) while offline.
+ * Call this when connectivity is restored - otherwise queued writes (wallet
+ * top-up, wishlist toggles, etc.) sit in storage forever and are never sent.
+ */
+export async function flushQueuedRequests(): Promise<void> {
+  const queue = await getQueue();
+  if (!queue.length) return;
+  await clearQueue();
+  for (const req of queue) {
+    try {
+      await api(req.path, { method: req.method, body: req.body });
+    } catch {
+      // Still failing (offline again, or a real error) - keep it queued for next time.
+      await enqueueRequest({ path: req.path, method: req.method, body: req.body });
+    }
+  }
 }
 
 export { getToken };

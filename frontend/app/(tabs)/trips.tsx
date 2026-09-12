@@ -4,19 +4,15 @@ import { Image } from "expo-image";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useFocusEffect, useRouter } from "expo-router";
+import Animated, { useSharedValue, useAnimatedStyle, withTiming, withDelay, Easing } from "react-native-reanimated";
 import { useTheme, tokens } from "@/src/theme";
 import { api } from "@/src/api/client";
+import { isBookingReviewed } from "@/src/features/reviews/reviewedStore";
+import { RaidexCard, RaidexStatusPill, RaidexEmptyState } from "@/src/components/ui";
 
 type Booking = {
   booking_id: string; status: string; plan: string; start_date: string; end_date: string;
-  total_amount: number; vehicle_snapshot: { name: string; image: string; location: string; brand: string };
-};
-
-const STATUS_COLORS: any = {
-  confirmed: { bg: "#E8F8F0", fg: "#037A42" },
-  active: { bg: "#FEF3C7", fg: "#92400E" },
-  completed: { bg: "#F4F4F5", fg: "#52525B" },
-  cancelled: { bg: "#FEE2E2", fg: "#991B1B" },
+  total_amount: number; vehicle_id: string; vehicle_snapshot: { name: string; image: string; location: string; brand: string };
 };
 
 export default function TripsScreen() {
@@ -75,6 +71,11 @@ export default function TripsScreen() {
       Alert.alert("Invoice", e.message || "Could not create invoice.");
     }
   };
+  const onWriteReview = (b: Booking) => {
+    router.push(
+      `/review/${b.booking_id}?vehicle_id=${encodeURIComponent(b.vehicle_id)}&vehicle_name=${encodeURIComponent(b.vehicle_snapshot.name)}&vehicle_image=${encodeURIComponent(b.vehicle_snapshot.image)}` as any
+    );
+  };
   const openDispute = (id: string) => {
     if (Platform.OS === "ios" && Alert.prompt) {
       Alert.prompt(
@@ -102,12 +103,12 @@ export default function TripsScreen() {
     <View style={{ flex: 1, backgroundColor: c.surface }}>
       <SafeAreaView edges={["top"]} style={{ backgroundColor: c.surface }}>
         <View style={{ paddingHorizontal: tokens.spacing.xl, paddingTop: tokens.spacing.md, paddingBottom: tokens.spacing.md }}>
-          <Text style={{ color: c.onSurface, fontSize: tokens.type.xxxl, fontWeight: "800" }}>My Trips</Text>
+          <Text style={{ color: c.onSurface, fontSize: tokens.type.xxxl, fontWeight: tokens.weight.bold }}>My Trips</Text>
         </View>
         <View style={{ flexDirection: "row", paddingHorizontal: tokens.spacing.xl, gap: 8, paddingBottom: tokens.spacing.md }}>
           {(["all", "active", "past"] as const).map((t) => (
             <Pressable key={t} testID={`trips-tab-${t}`} onPress={() => setTab(t)} style={[styles.tab, { backgroundColor: tab === t ? c.inverse : c.surface2 }]}>
-              <Text style={{ color: tab === t ? c.onInverse : c.onSurface, fontWeight: "700", textTransform: "capitalize" }}>{t}</Text>
+              <Text style={{ color: tab === t ? c.onInverse : c.onSurface, fontWeight: tokens.weight.semibold, textTransform: "capitalize" }}>{t}</Text>
             </Pressable>
           ))}
         </View>
@@ -121,84 +122,131 @@ export default function TripsScreen() {
           ItemSeparatorComponent={() => <View style={{ height: tokens.spacing.lg }} />}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} tintColor={c.accent} />}
           ListEmptyComponent={
-            <View style={{ alignItems: "center", marginTop: 60 }}>
-              <Ionicons name="car-outline" size={56} color={c.onSurface3} />
-              <Text style={{ color: c.onSurface2, marginTop: 16, fontSize: 16, fontWeight: "600" }}>No trips yet</Text>
-              <Text style={{ color: c.onSurface3, marginTop: 4 }}>Book a ride to see it here</Text>
-              <Pressable testID="explore-btn" onPress={() => router.push("/(tabs)")} style={[styles.exploreBtn, { backgroundColor: c.inverse }]}>
-                <Text style={{ color: c.onInverse, fontWeight: "700" }}>Explore Rides</Text>
-              </Pressable>
-            </View>
+            <RaidexEmptyState
+              icon="car-outline"
+              title="No trips yet"
+              subtitle="Book a ride to see it here"
+              actionLabel="Explore Rides"
+              onAction={() => router.push("/(tabs)")}
+              testID="trips-empty"
+            />
           }
-          renderItem={({ item }) => {
-            const sc = STATUS_COLORS[item.status] || STATUS_COLORS.confirmed;
-            return (
-              <View style={[styles.card, { backgroundColor: c.surface2, borderColor: c.border }]}>
-                <View style={{ flexDirection: "row", gap: 12 }}>
-                  <Image source={item.vehicle_snapshot.image} style={styles.thumb} contentFit="cover" />
-                  <View style={{ flex: 1 }}>
-                    <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" }}>
-                      <Text style={{ color: c.onSurface, fontSize: 16, fontWeight: "700", flex: 1 }} numberOfLines={1}>{item.vehicle_snapshot.name}</Text>
-                      <View style={{ backgroundColor: sc.bg, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 }}>
-                        <Text style={{ color: sc.fg, fontSize: 10, fontWeight: "800", textTransform: "uppercase" }}>{item.status}</Text>
-                      </View>
-                    </View>
-                    <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 2 }}>{item.vehicle_snapshot.location}</Text>
-                    <Text style={{ color: c.onSurface2, fontSize: 13, marginTop: 8 }}>
-                      {new Date(item.start_date).toLocaleDateString()} → {new Date(item.end_date).toLocaleDateString()}
-                    </Text>
-                    <Text style={{ color: c.onSurface, fontSize: 16, fontWeight: "800", marginTop: 6 }}>₹{item.total_amount.toLocaleString()}</Text>
-                  </View>
-                </View>
-                {item.status === "confirmed" && (
-                  <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
-                    <Pressable testID={`start-trip-${item.booking_id}`} onPress={() => onStart(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.accent, flex: 1, marginTop: 0 }]}>
-                      <Ionicons name="play" size={14} color="#fff" />
-                      <Text style={{ color: "#fff", fontWeight: "700" }}>Start</Text>
-                    </Pressable>
-                    <Pressable testID={`cancel-booking-${item.booking_id}`} onPress={() => cancelBooking(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.surface, borderWidth: 1, borderColor: c.border, flex: 1, marginTop: 0 }]}>
-                      <Ionicons name="close" size={14} color={c.error} />
-                      <Text style={{ color: c.error, fontWeight: "700" }}>Cancel</Text>
-                    </Pressable>
-                  </View>
-                )}
-                {item.status === "active" && (
-                  <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
-                    <Pressable testID={`resume-trip-${item.booking_id}`} onPress={() => onResume(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.accent, flex: 1 }]}>
-                      <Ionicons name="navigate" size={14} color="#fff" />
-                      <Text style={{ color: "#fff", fontWeight: "700" }}>Live trip</Text>
-                    </Pressable>
-                    <Pressable testID={`end-trip-${item.booking_id}`} onPress={() => onEnd(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.inverse, flex: 1 }]}>
-                      <Ionicons name="stop" size={14} color={c.onInverse} />
-                      <Text style={{ color: c.onInverse, fontWeight: "700" }}>End trip</Text>
-                    </Pressable>
-                  </View>
-                )}
-                {item.status === "completed" && (
-                  <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
-                    <Pressable testID={`invoice-${item.booking_id}`} onPress={() => showInvoice(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.inverse, flex: 1, marginTop: 0 }]}>
-                      <Ionicons name="receipt" size={14} color={c.onInverse} />
-                      <Text style={{ color: c.onInverse, fontWeight: "700" }}>Invoice</Text>
-                    </Pressable>
-                    <Pressable testID={`dispute-${item.booking_id}`} onPress={() => openDispute(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.surface, borderWidth: 1, borderColor: c.border, flex: 1, marginTop: 0 }]}>
-                      <Ionicons name="flag" size={14} color={c.onSurface} />
-                      <Text style={{ color: c.onSurface, fontWeight: "700" }}>Dispute</Text>
-                    </Pressable>
-                  </View>
-                )}
-              </View>
-            );
-          }}
+          renderItem={({ item, index }) => (
+            <TripCard
+              item={item}
+              index={index}
+              c={c}
+              onStart={onStart}
+              onEnd={onEnd}
+              onResume={onResume}
+              cancelBooking={cancelBooking}
+              showInvoice={showInvoice}
+              onWriteReview={onWriteReview}
+              openDispute={openDispute}
+            />
+          )}
         />
       )}
     </View>
   );
 }
 
+function TripCard({ item, index, c, onStart, onEnd, onResume, cancelBooking, showInvoice, onWriteReview, openDispute }: {
+  item: Booking;
+  index: number;
+  c: any;
+  onStart: (id: string) => void;
+  onEnd: (id: string) => void;
+  onResume: (id: string) => void;
+  cancelBooking: (id: string) => void;
+  showInvoice: (id: string) => void;
+  onWriteReview: (b: Booking) => void;
+  openDispute: (id: string) => void;
+}) {
+  const appear = useSharedValue(0);
+
+  useEffect(() => {
+    appear.value = withDelay(Math.min(index, 6) * 40, withTiming(1, { duration: tokens.motion.base, easing: Easing.out(Easing.cubic) }));
+  }, [appear, index]);
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    opacity: appear.value,
+    transform: [{ translateY: (1 - appear.value) * 14 }],
+  }));
+
+  return (
+    <Animated.View style={animatedStyle}>
+      <RaidexCard variant="flat" padding={14}>
+        <View style={{ flexDirection: "row", gap: 12 }}>
+          <Image source={item.vehicle_snapshot.image} style={styles.thumb} contentFit="cover" />
+          <View style={{ flex: 1 }}>
+            <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" }}>
+              <Text style={{ color: c.onSurface, fontSize: 16, fontWeight: tokens.weight.semibold, flex: 1 }} numberOfLines={1}>{item.vehicle_snapshot.name}</Text>
+              <RaidexStatusPill status={item.status} />
+            </View>
+            <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 2 }}>{item.vehicle_snapshot.location}</Text>
+            <Text style={{ color: c.onSurface2, fontSize: 13, marginTop: 8 }}>
+              {new Date(item.start_date).toLocaleDateString()} → {new Date(item.end_date).toLocaleDateString()}
+            </Text>
+            <Text style={{ color: c.onSurface, fontSize: 16, fontWeight: tokens.weight.black, marginTop: 6 }}>₹{item.total_amount.toLocaleString()}</Text>
+          </View>
+        </View>
+        {item.status === "confirmed" && (
+          <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+            <Pressable testID={`start-trip-${item.booking_id}`} onPress={() => onStart(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.accent, flex: 1, marginTop: 0 }]}>
+              <Ionicons name="play" size={14} color="#fff" />
+              <Text style={{ color: "#fff", fontWeight: tokens.weight.semibold }}>Start</Text>
+            </Pressable>
+            <Pressable testID={`cancel-booking-${item.booking_id}`} onPress={() => cancelBooking(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.surface, borderWidth: 1, borderColor: c.border, flex: 1, marginTop: 0 }]}>
+              <Ionicons name="close" size={14} color={c.error} />
+              <Text style={{ color: c.error, fontWeight: tokens.weight.semibold }}>Cancel</Text>
+            </Pressable>
+          </View>
+        )}
+        {item.status === "active" && (
+          <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+            <Pressable testID={`resume-trip-${item.booking_id}`} onPress={() => onResume(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.accent, flex: 1 }]}>
+              <Ionicons name="navigate" size={14} color="#fff" />
+              <Text style={{ color: "#fff", fontWeight: tokens.weight.semibold }}>Live trip</Text>
+            </Pressable>
+            <Pressable testID={`end-trip-${item.booking_id}`} onPress={() => onEnd(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.inverse, flex: 1 }]}>
+              <Ionicons name="stop" size={14} color={c.onInverse} />
+              <Text style={{ color: c.onInverse, fontWeight: tokens.weight.semibold }}>End trip</Text>
+            </Pressable>
+          </View>
+        )}
+        {item.status === "completed" && (
+          <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+            <Pressable testID={`invoice-${item.booking_id}`} onPress={() => showInvoice(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.inverse, flex: 1, marginTop: 0 }]}>
+              <Ionicons name="receipt" size={14} color={c.onInverse} />
+              <Text style={{ color: c.onInverse, fontWeight: tokens.weight.semibold }}>Invoice</Text>
+            </Pressable>
+            <Pressable testID={`dispute-${item.booking_id}`} onPress={() => openDispute(item.booking_id)} style={[styles.actionBtn, { backgroundColor: c.surface, borderWidth: 1, borderColor: c.border, flex: 1, marginTop: 0 }]}>
+              <Ionicons name="flag" size={14} color={c.onSurface} />
+              <Text style={{ color: c.onSurface, fontWeight: tokens.weight.semibold }}>Dispute</Text>
+            </Pressable>
+          </View>
+        )}
+        {item.status === "completed" && (
+          isBookingReviewed(item.booking_id) ? (
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: 8 }}>
+              <Ionicons name="checkmark-circle" size={14} color={c.accent} />
+              <Text style={{ color: c.onSurface3, fontSize: 12, fontWeight: tokens.weight.semibold }}>You reviewed this trip</Text>
+            </View>
+          ) : (
+            <Pressable testID={`write-review-${item.booking_id}`} onPress={() => onWriteReview(item)} style={[styles.actionBtn, { backgroundColor: c.warning, marginTop: 8 }]}>
+              <Ionicons name="star" size={14} color="#fff" />
+              <Text style={{ color: "#fff", fontWeight: tokens.weight.semibold }}>Write a review</Text>
+            </Pressable>
+          )
+        )}
+      </RaidexCard>
+    </Animated.View>
+  );
+}
+
 const styles = StyleSheet.create({
   tab: { paddingHorizontal: 16, paddingVertical: 8, borderRadius: 999 },
-  card: { borderRadius: 18, borderWidth: 1, padding: 14 },
   thumb: { width: 96, height: 96, borderRadius: 14 },
   actionBtn: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, paddingVertical: 12, borderRadius: 12, marginTop: 12 },
-  exploreBtn: { paddingHorizontal: 24, paddingVertical: 12, borderRadius: 12, marginTop: 20 },
 });

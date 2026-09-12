@@ -8,6 +8,8 @@ export type RazorpaySuccess = {
   razorpay_signature: string;
 };
 
+type PreferredMethod = "card" | "upi" | "netbanking";
+
 type Props = {
   keyId: string;
   orderId: string;
@@ -15,6 +17,8 @@ type Props = {
   name: string;
   email: string;
   description?: string;
+  /** Restrict Razorpay's own checkout to the method chosen on our checkout screen. */
+  method?: PreferredMethod;
   onSuccess: (result: RazorpaySuccess) => void;
   onFailure: (reason: string) => void;
 };
@@ -30,6 +34,7 @@ export function RazorpayCheckout({
   name,
   email,
   description = "Raidex booking payment",
+  method,
   onSuccess,
   onFailure,
 }: Props) {
@@ -45,6 +50,9 @@ export function RazorpayCheckout({
       description,
       prefill: { name, email },
       theme: { color: "#05C46B" },
+      // Restrict Razorpay's checkout to the method the user picked on our
+      // checkout screen instead of showing the full method picker again.
+      method: method ? { card: method === "card", netbanking: method === "netbanking", upi: method === "upi", wallet: false, paylater: false } : undefined,
     });
     return `<!DOCTYPE html>
 <html><head>
@@ -77,7 +85,7 @@ export function RazorpayCheckout({
   }
 </script>
 </body></html>`;
-  }, [keyId, orderId, amountPaise, name, email, description]);
+  }, [keyId, orderId, amountPaise, name, email, description, method]);
 
   const onMessage = (event: WebViewMessageEvent) => {
     try {
