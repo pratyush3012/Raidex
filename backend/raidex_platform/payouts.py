@@ -112,9 +112,13 @@ class PayoutService:
         return payout
 
     async def mark_paid(self, payout_id: str, *, payment_reference: str, notes: Optional[str] = None) -> Optional[dict]:
+        # Idempotent by construction, not just by the caller's own pre-check:
+        # only a payout that isn't already "paid" can be transitioned here, so
+        # this method carries its own guarantee rather than relying on every
+        # caller to pre-check status itself.
         now = datetime.now(timezone.utc).isoformat()
         await self.db.payouts.update_one(
-            {"payout_id": payout_id},
+            {"payout_id": payout_id, "status": {"$ne": "paid"}},
             {"$set": {"status": "paid", "paid_at": now, "payment_reference": payment_reference, "notes": notes}},
         )
         return await self.db.payouts.find_one({"payout_id": payout_id}, {"_id": 0})

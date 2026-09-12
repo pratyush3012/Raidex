@@ -6,6 +6,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { useTheme, tokens } from "@/src/theme";
 import { api } from "@/src/api/client";
+import { approveKyc, rejectKyc, updateDispute, approveVehicleSwap, rejectVehicleSwap } from "@/src/features/admin/api/admin";
 import { useAuth } from "@/src/context/AuthContext";
 import {
   RaidexButton,
@@ -19,11 +20,11 @@ import {
   RaidexMetricCard,
 } from "@/src/components/ui";
 
-type Tab = "kpis" | "vehicles" | "kyc" | "users" | "payments" | "disputes" | "geofence" | "health" | "nexus" | "payouts" | "flags";
+type Tab = "kpis" | "vehicles" | "kyc" | "users" | "payments" | "disputes" | "swaps" | "geofence" | "health" | "nexus" | "payouts" | "flags";
 
 // Tabs whose body is a fetched list - these get row skeletons while loading
 // instead of the generic top-of-scroll spinner used for the rest.
-const LIST_TABS: Tab[] = ["vehicles", "kyc", "users", "payments", "disputes", "geofence", "payouts"];
+const LIST_TABS: Tab[] = ["vehicles", "kyc", "users", "payments", "disputes", "swaps", "geofence", "payouts"];
 
 // Flags this app actually checks somewhere (via GET /features/{flag} or
 // FeatureFlagService) - shown even if no admin has ever saved a row for them
@@ -58,9 +59,15 @@ export default function AdminConsole() {
   const [geo, setGeo] = useState<any[]>([]);
   const [health, setHealth] = useState<any>(null);
   const [payouts, setPayouts] = useState<any[]>([]);
+  const [swaps, setSwaps] = useState<any[]>([]);
   const [commissionConfig, setCommissionConfig] = useState<any>(null);
   const [payoutStatusFilter, setPayoutStatusFilter] = useState("");
   const [markPaidTarget, setMarkPaidTarget] = useState<any>(null);
+  const [kycRejectTarget, setKycRejectTarget] = useState<any>(null);
+  const [kycBusyId, setKycBusyId] = useState<string | null>(null);
+  const [disputeTarget, setDisputeTarget] = useState<{ dispute: any; status: "resolved" | "rejected" } | null>(null);
+  const [swapRejectTarget, setSwapRejectTarget] = useState<any>(null);
+  const [swapBusyId, setSwapBusyId] = useState<string | null>(null);
   const [editingCommission, setEditingCommission] = useState(false);
   const [commissionInput, setCommissionInput] = useState("");
   const [flags, setFlags] = useState<Record<string, any>>({});
@@ -84,6 +91,7 @@ export default function AdminConsole() {
       if (t === "users") setUsers(await api<any[]>("/admin/users"));
       if (t === "payments") setPayments(await api<any[]>("/admin/payments"));
       if (t === "disputes") setDisputes(await api<any[]>("/admin/disputes"));
+      if (t === "swaps") setSwaps(await api<any[]>("/admin/vehicle-swaps?status=requested"));
       if (t === "geofence") setGeo(await api<any[]>("/admin/geofence-events"));
       if (t === "health") setHealth(await api<any>("/admin/system-health"));
       if (t === "payouts") {
@@ -129,6 +137,60 @@ export default function AdminConsole() {
     );
   };
 
+  const approveKycSubmission = async (kycId: string) => {
+    setKycBusyId(kycId);
+    try {
+      await approveKyc(kycId);
+      loadTab("kyc");
+    } catch (e: any) {
+      Alert.alert("Error", e.message);
+    } finally {
+      setKycBusyId(null);
+    }
+  };
+
+  const rejectKycSubmission = async (kycId: string, reason: string) => {
+    try {
+      await rejectKyc(kycId, reason);
+      setKycRejectTarget(null);
+      loadTab("kyc");
+    } catch (e: any) {
+      Alert.alert("Error", e.message);
+    }
+  };
+
+  const resolveDispute = async (disputeId: string, status: "resolved" | "rejected", resolution: string) => {
+    try {
+      await updateDispute(disputeId, { status, resolution: resolution.trim() || undefined });
+      setDisputeTarget(null);
+      loadTab("disputes");
+    } catch (e: any) {
+      Alert.alert("Error", e.message);
+    }
+  };
+
+  const approveSwap = async (swapId: string) => {
+    setSwapBusyId(swapId);
+    try {
+      await approveVehicleSwap(swapId);
+      loadTab("swaps");
+    } catch (e: any) {
+      Alert.alert("Error", e.message);
+    } finally {
+      setSwapBusyId(null);
+    }
+  };
+
+  const rejectSwap = async (swapId: string, notes: string) => {
+    try {
+      await rejectVehicleSwap(swapId, notes.trim() || undefined);
+      setSwapRejectTarget(null);
+      loadTab("swaps");
+    } catch (e: any) {
+      Alert.alert("Error", e.message);
+    }
+  };
+
   useEffect(() => { if (isAdmin) loadTab(tab); }, [isAdmin, tab, loadTab]);
 
   if (!isAdmin) {
@@ -151,6 +213,7 @@ export default function AdminConsole() {
     { k: "users", label: "Users", ic: "people" },
     { k: "payments", label: "Payments", ic: "card" },
     { k: "disputes", label: "Disputes", ic: "flag" },
+    { k: "swaps", label: "Swaps", ic: "swap-horizontal" },
     { k: "geofence", label: "Geofence", ic: "shield" },
     { k: "health", label: "Health", ic: "pulse" },
     { k: "nexus", label: "AI Nexus", ic: "sparkles" },
@@ -346,13 +409,35 @@ export default function AdminConsole() {
               <RaidexEmptyState icon="id-card-outline" title="No KYC submissions yet" />
             ) : (
               kyc.map((item) => (
-                <RaidexCard key={item.kyc_id} padding={tokens.spacing.md} style={{ flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 8 }}>
-                  <Ionicons name={item.status === "verified" ? "checkmark-circle" : item.status === "rejected" ? "close-circle" : "time"} size={22} color={item.status === "verified" ? c.accent : item.status === "rejected" ? c.error : c.warning} />
-                  <View style={{ flex: 1 }}>
-                    <Text style={{ color: c.onSurface, fontWeight: tokens.weight.semibold }}>{item.dl_number || item.user_id}</Text>
-                    <Text style={{ color: c.onSurface3, fontSize: 11 }}>Aadhaar: ****{item.aadhaar_last4} · {item.provider || "provider"}</Text>
+                <RaidexCard key={item.kyc_id} padding={tokens.spacing.md} style={{ marginBottom: 8 }}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+                    <Ionicons name={item.status === "verified" ? "checkmark-circle" : item.status === "rejected" ? "close-circle" : "time"} size={22} color={item.status === "verified" ? c.accent : item.status === "rejected" ? c.error : c.warning} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: c.onSurface, fontWeight: tokens.weight.semibold }}>{item.dl_number || item.user_id}</Text>
+                      <Text style={{ color: c.onSurface3, fontSize: 11 }}>Aadhaar: ****{item.aadhaar_last4} · {item.provider || "provider"}</Text>
+                    </View>
+                    <RaidexStatusPill status={item.status} />
                   </View>
-                  <RaidexStatusPill status={item.status} />
+                  {item.status === "processing" && (
+                    <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+                      <RaidexButton
+                        testID={`kyc-approve-${item.kyc_id}`}
+                        label="Approve"
+                        onPress={() => approveKycSubmission(item.kyc_id)}
+                        loading={kycBusyId === item.kyc_id}
+                        size="md"
+                        fullWidth={false}
+                      />
+                      <RaidexButton
+                        testID={`kyc-reject-${item.kyc_id}`}
+                        label="Reject"
+                        onPress={() => setKycRejectTarget(item)}
+                        variant="destructive"
+                        size="md"
+                        fullWidth={false}
+                      />
+                    </View>
+                  )}
                 </RaidexCard>
               ))
             )}
@@ -390,13 +475,76 @@ export default function AdminConsole() {
               <RaidexEmptyState icon="flag-outline" title="No disputes" />
             ) : (
               disputes.map((d) => (
-                <RaidexCard key={d.dispute_id} padding={tokens.spacing.md} style={{ flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 8 }}>
-                  <Ionicons name="flag" size={20} color={d.status === "resolved" ? c.accent : c.warning} />
-                  <View style={{ flex: 1 }}>
-                    <Text style={{ color: c.onSurface, fontWeight: tokens.weight.semibold, textTransform: "capitalize" }}>{d.category}</Text>
-                    <Text style={{ color: c.onSurface3, fontSize: 11 }} numberOfLines={2}>{d.message}</Text>
+                <RaidexCard key={d.dispute_id} padding={tokens.spacing.md} style={{ marginBottom: 8 }}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+                    <Ionicons name="flag" size={20} color={d.status === "resolved" ? c.accent : c.warning} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: c.onSurface, fontWeight: tokens.weight.semibold, textTransform: "capitalize" }}>{d.category}</Text>
+                      <Text style={{ color: c.onSurface3, fontSize: 11 }} numberOfLines={2}>{d.message}</Text>
+                    </View>
+                    <RaidexStatusPill status={d.status} />
                   </View>
-                  <RaidexStatusPill status={d.status} />
+                  {(d.status === "open" || d.status === "investigating") && (
+                    <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+                      <RaidexButton
+                        testID={`dispute-resolve-${d.dispute_id}`}
+                        label="Resolve"
+                        onPress={() => setDisputeTarget({ dispute: d, status: "resolved" })}
+                        size="md"
+                        fullWidth={false}
+                      />
+                      <RaidexButton
+                        testID={`dispute-reject-${d.dispute_id}`}
+                        label="Reject"
+                        onPress={() => setDisputeTarget({ dispute: d, status: "rejected" })}
+                        variant="destructive"
+                        size="md"
+                        fullWidth={false}
+                      />
+                    </View>
+                  )}
+                </RaidexCard>
+              ))
+            )}
+          </View>
+        )}
+
+        {tab === "swaps" && (
+          <View>
+            <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: 14, marginBottom: 12 }}>Vehicle swap requests ({swaps.length})</Text>
+            {loading && swaps.length === 0 ? (
+              <RowSkeletons />
+            ) : swaps.length === 0 ? (
+              <RaidexEmptyState icon="swap-horizontal-outline" title="No swap requests" />
+            ) : (
+              swaps.map((s) => (
+                <RaidexCard key={s.swap_id} padding={tokens.spacing.md} style={{ marginBottom: 8 }}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+                    <Ionicons name="swap-horizontal" size={22} color={c.warning} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: c.onSurface, fontWeight: tokens.weight.semibold }}>Vehicle {s.old_vehicle_id} → {s.new_vehicle_id}</Text>
+                      <Text style={{ color: c.onSurface3, fontSize: 11 }}>Subscription {s.subscription_id} · Fee ₹{Number(s.fee_amount || 0).toLocaleString()}</Text>
+                    </View>
+                    <RaidexStatusPill status={s.status} />
+                  </View>
+                  <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+                    <RaidexButton
+                      testID={`swap-approve-${s.swap_id}`}
+                      label="Approve"
+                      onPress={() => approveSwap(s.swap_id)}
+                      loading={swapBusyId === s.swap_id}
+                      size="md"
+                      fullWidth={false}
+                    />
+                    <RaidexButton
+                      testID={`swap-reject-${s.swap_id}`}
+                      label="Reject"
+                      onPress={() => setSwapRejectTarget(s)}
+                      variant="destructive"
+                      size="md"
+                      fullWidth={false}
+                    />
+                  </View>
                 </RaidexCard>
               ))
             )}
@@ -631,6 +779,31 @@ export default function AdminConsole() {
           onConfirm={(ref: string) => markPayoutPaid(markPaidTarget.payout_id, ref)}
         />
       )}
+
+      {kycRejectTarget && (
+        <KycRejectModal
+          submission={kycRejectTarget}
+          onDismiss={() => setKycRejectTarget(null)}
+          onConfirm={(reason: string) => rejectKycSubmission(kycRejectTarget.kyc_id, reason)}
+        />
+      )}
+
+      {disputeTarget && (
+        <DisputeResolveModal
+          dispute={disputeTarget.dispute}
+          status={disputeTarget.status}
+          onDismiss={() => setDisputeTarget(null)}
+          onConfirm={(notes: string) => resolveDispute(disputeTarget.dispute.dispute_id, disputeTarget.status, notes)}
+        />
+      )}
+
+      {swapRejectTarget && (
+        <SwapRejectModal
+          swap={swapRejectTarget}
+          onDismiss={() => setSwapRejectTarget(null)}
+          onConfirm={(notes: string) => rejectSwap(swapRejectTarget.swap_id, notes)}
+        />
+      )}
     </View>
   );
 }
@@ -692,6 +865,116 @@ function MarkPaidModal({ payout, onDismiss, onConfirm }: any) {
         value={reference}
         onChangeText={setReference}
         placeholder="Payment reference (e.g. UTR / transaction id)"
+      />
+    </RaidexModal>
+  );
+}
+
+function KycRejectModal({ submission, onDismiss, onConfirm }: any) {
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async () => {
+    if (!reason.trim()) {
+      Alert.alert("Reason required", "Enter a reason for rejecting this KYC submission.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await onConfirm(reason.trim());
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <RaidexModal
+      visible
+      testID="kyc-reject-modal"
+      title="Reject KYC submission"
+      subtitle={submission.dl_number ? `DL ${submission.dl_number}` : submission.user_id}
+      onDismiss={onDismiss}
+      primaryLabel="Confirm reject"
+      onPrimary={submit}
+      primaryBusy={busy}
+      primaryVariant="destructive"
+      dismissTestID="kyc-reject-dismiss-btn"
+      primaryTestID="kyc-reject-confirm-btn"
+    >
+      <RaidexInput
+        testID="kyc-reject-reason-input"
+        value={reason}
+        onChangeText={setReason}
+        placeholder="Reason (shown to the applicant)"
+      />
+    </RaidexModal>
+  );
+}
+
+function DisputeResolveModal({ dispute, status, onDismiss, onConfirm }: any) {
+  const [notes, setNotes] = useState("");
+  const [busy, setBusy] = useState(false);
+  const isReject = status === "rejected";
+  const submit = async () => {
+    setBusy(true);
+    try {
+      await onConfirm(notes);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <RaidexModal
+      visible
+      testID="dispute-resolve-modal"
+      title={isReject ? "Reject dispute" : "Resolve dispute"}
+      subtitle={dispute.message}
+      onDismiss={onDismiss}
+      primaryLabel={isReject ? "Confirm reject" : "Confirm resolved"}
+      onPrimary={submit}
+      primaryBusy={busy}
+      primaryVariant={isReject ? "destructive" : "primary"}
+      dismissTestID="dispute-resolve-dismiss-btn"
+      primaryTestID="dispute-resolve-confirm-btn"
+    >
+      <RaidexInput
+        testID="dispute-resolve-notes-input"
+        value={notes}
+        onChangeText={setNotes}
+        placeholder="Resolution notes (optional)"
+      />
+    </RaidexModal>
+  );
+}
+
+function SwapRejectModal({ swap, onDismiss, onConfirm }: any) {
+  const [notes, setNotes] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async () => {
+    setBusy(true);
+    try {
+      await onConfirm(notes);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <RaidexModal
+      visible
+      testID="swap-reject-modal"
+      title="Reject vehicle swap"
+      subtitle={`${swap.old_vehicle_id} → ${swap.new_vehicle_id}`}
+      onDismiss={onDismiss}
+      primaryLabel="Confirm reject"
+      onPrimary={submit}
+      primaryBusy={busy}
+      primaryVariant="destructive"
+      dismissTestID="swap-reject-dismiss-btn"
+      primaryTestID="swap-reject-confirm-btn"
+    >
+      <RaidexInput
+        testID="swap-reject-notes-input"
+        value={notes}
+        onChangeText={setNotes}
+        placeholder="Notes (optional)"
       />
     </RaidexModal>
   );

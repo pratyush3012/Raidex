@@ -211,6 +211,7 @@ class DB:
         self.fraud_flags = Collection()
         self.analytics_snapshots = Collection()
         self.phone_otp_challenges = Collection()
+        self.push_tokens = Collection()
 
     async def command(self, *_args, **_kwargs):
         return {"ok": 1}

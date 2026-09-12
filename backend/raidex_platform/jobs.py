@@ -36,4 +36,5 @@ def default_job_registry() -> BackgroundJobRegistry:
     registry.register("fraud_scans", "hourly", "scan_fraud_rules")
     registry.register("analytics_aggregation", "hourly", "aggregate_analytics")
     registry.register("subscription_expiry", "daily", "expire_subscriptions")
+    registry.register("notification_outbox_drain", "every_15_minutes", "drain_notification_outbox")
     return registry

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from raidex_platform.jobs import JobRunner, default_job_registry
 from raidex_platform import scheduled_jobs as jobs
+from raidex_platform.notifications import NotificationService
 from test_quality_flows import fake_db, vehicle  # noqa: F401
 
 
@@ -100,6 +101,79 @@ async def test_expire_subscriptions_notifies_affected_users(fake_db):
     assert fake_db.subscriptions.docs[0]["status"] == "expired"
     assert fake_db.vehicles.docs[0]["available"] is True
     assert any(n["type"] == "subscription" for n in fake_db.notifications.docs)
+
+
+@pytest.mark.asyncio
+async def test_drain_notification_outbox_delivers_to_registered_token(fake_db):
+    """A queued push-channel outbox row reaches the user's registered device
+    token via the push sender (RAIDEX_FINAL_PRODUCTION_AUDIT P1-4)."""
+    fake_db.push_tokens.docs.append({"user_id": "usr_1", "token": "tok_good"})
+    await NotificationService(fake_db).notify(
+        user_id="usr_1", title="Booking Confirmed", body="Your trip is ready", ntype="booking",
+    )
+
+    delivered = []
+
+    class FakeSender:
+        async def send_to_token(self, token, payload):
+            delivered.append((token, payload.title, payload.body))
+            return True
+
+    runner = JobRunner(fake_db, default_job_registry())
+    result = await jobs.drain_notification_outbox(fake_db, runner, push_sender=FakeSender())
+
+    assert result == {"sent": 1, "skipped": 0, "failed": 0}
+    assert delivered == [("tok_good", "Booking Confirmed", "Your trip is ready")]
+    push_row = next(r for r in fake_db.notification_outbox.docs if r["channel"] == "push")
+    assert push_row["status"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_drain_notification_outbox_prunes_invalid_token_without_blocking_others(fake_db):
+    """One dead token must not stop delivery to the same user's other tokens,
+    nor crash the drain job - and the dead token gets pruned so it is never
+    retried forever."""
+    fake_db.push_tokens.docs.append({"user_id": "usr_1", "token": "tok_dead"})
+    fake_db.push_tokens.docs.append({"user_id": "usr_1", "token": "tok_alive"})
+    await NotificationService(fake_db).notify(
+        user_id="usr_1", title="Payment Failed", body="Your card was declined", ntype="payment",
+    )
+
+    class FlakySender:
+        async def send_to_token(self, token, payload):
+            if token == "tok_dead":
+                return False
+            return True
+
+    runner = JobRunner(fake_db, default_job_registry())
+    result = await jobs.drain_notification_outbox(fake_db, runner, push_sender=FlakySender())
+
+    assert result == {"sent": 1, "skipped": 0, "failed": 0}
+    assert {d["token"] for d in fake_db.push_tokens.docs} == {"tok_alive"}
+    push_row = next(r for r in fake_db.notification_outbox.docs if r["channel"] == "push")
+    assert push_row["status"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_drain_notification_outbox_skips_user_with_no_token_without_erroring(fake_db):
+    """A user with zero registered push tokens must not error the drain job -
+    the in-app notification row (written by notify() regardless) stands on
+    its own."""
+    await NotificationService(fake_db).notify(
+        user_id="usr_1", title="KYC Approved", body="You're verified", ntype="KYCApproved",
+    )
+    assert len(fake_db.notifications.docs) == 1
+
+    class ShouldNotBeCalledSender:
+        async def send_to_token(self, token, payload):
+            raise AssertionError("send_to_token should not be called with no registered tokens")
+
+    runner = JobRunner(fake_db, default_job_registry())
+    result = await jobs.drain_notification_outbox(fake_db, runner, push_sender=ShouldNotBeCalledSender())
+
+    assert result == {"sent": 0, "skipped": 1, "failed": 0}
+    push_row = next(r for r in fake_db.notification_outbox.docs if r["channel"] == "push")
+    assert push_row["status"] == "skipped_no_token"
 
 
 @pytest.mark.asyncio

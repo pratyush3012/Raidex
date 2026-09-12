@@ -13,6 +13,7 @@ from raidex_platform.notifications import NotificationService
 from raidex_platform.analytics import AnalyticsEngine
 from raidex_platform.jobs import JobRunner
 from raidex_platform.subscriptions import SubscriptionService
+from providers.push_sender import get_push_sender, PushPayload
 
 
 def _now() -> datetime:
@@ -188,6 +189,83 @@ async def expire_subscriptions(db, runner: JobRunner) -> dict:
     return {"expired": len(expired)}
 
 
+async def drain_notification_outbox(db, runner: JobRunner, push_sender: Any | None = None) -> dict:
+    """Delivers every due 'push'-channel row in `notification_outbox` to the
+    user's registered device tokens (see RAIDEX_FINAL_PRODUCTION_AUDIT P1-4:
+    `NotificationService.notify()` writes an outbox row per channel, but
+    nothing ever drained the 'push' rows through `providers/push_sender.py`,
+    so every in-app notification silently became push-notification-less).
+
+    A token that a send attempt rejects is treated as stale/invalid and
+    pruned from `push_tokens` immediately so it is never retried forever,
+    without affecting delivery to the same user's other tokens. A user with
+    no registered token is not an error - their in-app notification row
+    (already written by `notify()`) stands on its own and the outbox row is
+    marked 'skipped_no_token'.
+    """
+    sender = push_sender or get_push_sender()
+    now = _iso(_now())
+    rows = await db.notification_outbox.find(
+        {"channel": "push", "status": "queued", "next_attempt_at": {"$lte": now}}
+    ).to_list(500)
+
+    sent = skipped = failed = 0
+
+    for row in rows:
+        notification = await db.notifications.find_one(
+            {"notification_id": row["notification_id"]}, {"_id": 0}
+        )
+        if not notification:
+            await db.notification_outbox.update_one(
+                {"outbox_id": row["outbox_id"]},
+                {"$set": {"status": "failed", "last_error": "notification_not_found"}},
+            )
+            failed += 1
+            continue
+
+        token_docs = await db.push_tokens.find(
+            {"user_id": row["user_id"]}, {"_id": 0, "token": 1}
+        ).to_list(20)
+
+        if not token_docs:
+            await db.notification_outbox.update_one(
+                {"outbox_id": row["outbox_id"]},
+                {"$set": {"status": "skipped_no_token"}},
+            )
+            skipped += 1
+            continue
+
+        payload = PushPayload(user_id=row["user_id"], title=notification["title"], body=notification["body"])
+        delivered = False
+        for doc in token_docs:
+            token = doc["token"]
+            try:
+                ok = await sender.send_to_token(token, payload)
+            except Exception:
+                ok = False
+            if ok:
+                delivered = True
+            else:
+                # Stale/invalid token - prune so it's never retried forever,
+                # without touching this user's other (possibly valid) tokens.
+                await db.push_tokens.delete_one({"user_id": row["user_id"], "token": token})
+
+        await db.notification_outbox.update_one(
+            {"outbox_id": row["outbox_id"]},
+            {"$set": {
+                "status": "sent" if delivered else "failed",
+                "attempts": int(row.get("attempts", 0)) + 1,
+            }},
+        )
+        if delivered:
+            sent += 1
+        else:
+            failed += 1
+
+    await runner.record_run("notification_outbox_drain", "success", {"sent": sent, "skipped": skipped, "failed": failed})
+    return {"sent": sent, "skipped": skipped, "failed": failed}
+
+
 HANDLERS = {
     "send_insurance_reminders": send_insurance_reminders,
     "send_document_expiry_reminders": send_document_expiry_reminders,
@@ -196,6 +274,7 @@ HANDLERS = {
     "scan_fraud_rules": scan_fraud_rules,
     "aggregate_analytics": aggregate_analytics,
     "expire_subscriptions": expire_subscriptions,
+    "drain_notification_outbox": drain_notification_outbox,
 }
 
 

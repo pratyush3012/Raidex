@@ -114,6 +114,23 @@ async def test_admin_mark_payout_paid_is_idempotent_and_audited(fake_db):
 
 
 @pytest.mark.asyncio
+async def test_payout_service_mark_paid_is_idempotent_without_a_caller_precheck(fake_db):
+    """The service itself must guarantee idempotency, not just the route
+    handler's own before['status'] == 'paid' pre-check - calling
+    PayoutService.mark_paid directly twice must not let a second call
+    overwrite the first's payment_reference."""
+    await PayoutService(fake_db).create_payout_for_booking(_completed_booking())
+    payout_id = fake_db.payouts.docs[0]["payout_id"]
+
+    first = await PayoutService(fake_db).mark_paid(payout_id, payment_reference="txn_first")
+    assert first["status"] == "paid"
+    assert first["payment_reference"] == "txn_first"
+
+    second = await PayoutService(fake_db).mark_paid(payout_id, payment_reference="txn_second")
+    assert second["payment_reference"] == "txn_first"
+
+
+@pytest.mark.asyncio
 async def test_milestone_crossing_awards_benefit_exactly_once(fake_db):
     fake_db.vehicles.docs.append(vehicle(vehicle_id="veh_1", owner_id=OWNER_ID, lifetime_km=9990))
     svc = ServiceMilestoneService(fake_db)
