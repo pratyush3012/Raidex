@@ -15,7 +15,7 @@ import re
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
-from typing import List, Optional, Literal
+from typing import Any, List, Optional, Literal
 import uuid
 from datetime import datetime, timezone, timedelta
 import bcrypt as _bcrypt_lib
@@ -34,7 +34,7 @@ from providers import (
     get_gps_provider, get_sms_provider,
 )
 from providers.ai_provider import ChatTurn
-from providers.gps_provider import LocationEvent
+from providers.gps_provider import LocationEvent, haversine_m
 from features.booking import BookingService
 from raidex_platform.analytics import AnalyticsEngine
 from raidex_platform.commission import CommissionService
@@ -50,6 +50,7 @@ from raidex_platform.jobs import JobRunner, default_job_registry
 from raidex_platform.notifications import NotificationService
 from raidex_platform.observability import ObservabilityMetrics
 from raidex_platform.pricing import DynamicPricingEngine
+from raidex_platform.pricing_engine import PricingConfigService, PricingEngine, derive_default_rate_range
 from raidex_platform.rate_limits import rate_limit_for_role, parse_rate_limit
 from raidex_platform.rate_limiter import get_rate_limiter
 from raidex_platform.recommendations import RecommendationEngine
@@ -325,6 +326,19 @@ class Vehicle(BaseModel):
     price_per_day: float
     price_per_week: float
     price_per_month: float
+    # Admin-configured range the PricingEngine's hourly rate is clamped
+    # within (see raidex_platform/pricing_engine.py). Optional here because
+    # older/just-created vehicles get these lazily backfilled from
+    # price_per_hour the first time they're priced - see
+    # BookingService._ensure_rate_range - rather than requiring every
+    # existing vehicle document to be migrated up front.
+    min_hourly_rate: Optional[float] = None
+    max_hourly_rate: Optional[float] = None
+    # Host-controlled early-pickup policy: "free_only" (the default) means
+    # only the admin-configured free grace window is ever allowed;
+    # "paid_allowed" opts this specific vehicle into paid early check-in
+    # beyond grace; "not_allowed" disables even the free grace window.
+    early_checkin_policy: Literal["not_allowed", "free_only", "paid_allowed"] = "free_only"
     deposit: float
     transmission: str  # Auto/Manual
     fuel_type: str  # Petrol/Diesel/EV
@@ -382,6 +396,25 @@ class ReviewCreate(BaseModel):
 class CouponValidateRequest(BaseModel):
     code: str = Field(min_length=2, max_length=40)
     amount: float = Field(gt=0)
+
+class CouponCreate(BaseModel):
+    code: str = Field(min_length=2, max_length=40)
+    type: Literal["percent", "flat"]
+    value: float = Field(gt=0)
+    max_discount: Optional[float] = Field(default=None, gt=0)
+    description: str = Field(default="", max_length=300)
+    active: bool = True
+    expires_at: Optional[str] = None
+    min_amount: Optional[float] = Field(default=None, ge=0)
+
+class CouponUpdate(BaseModel):
+    type: Optional[Literal["percent", "flat"]] = None
+    value: Optional[float] = Field(default=None, gt=0)
+    max_discount: Optional[float] = None
+    description: Optional[str] = Field(default=None, max_length=300)
+    active: Optional[bool] = None
+    expires_at: Optional[str] = None
+    min_amount: Optional[float] = None
 
 class ReferralCreateRequest(BaseModel):
     referred_email: EmailStr
@@ -650,11 +683,20 @@ async def public_config():
     """Public client config (no secrets)."""
     payment_provider = os.getenv("PAYMENT_PROVIDER", "mock").lower()
     key_id = os.getenv("RAZORPAY_KEY_ID", "")
+    pricing_config = await PricingConfigService(db).get_config()
     return {
         "payment_provider": payment_provider,
         "push_provider": os.getenv("PUSH_PROVIDER", "log").lower(),
         "kyc_provider": os.getenv("KYC_PROVIDER", "stub").lower(),
         "razorpay_key_id": key_id if payment_provider == "razorpay" and key_id.startswith("rzp_") else None,
+        # min_booking_lead_hours kept for older clients; min_notice_hours is
+        # the same admin-configurable value (see PricingConfigService) going
+        # forward - both always agree since the latter now falls back to this
+        # same env-driven default.
+        "min_booking_lead_hours": pricing_config.get("min_notice_hours", BookingService.MIN_BOOKING_LEAD_HOURS),
+        "min_notice_hours": pricing_config.get("min_notice_hours", BookingService.MIN_BOOKING_LEAD_HOURS),
+        "min_booking_hours": pricing_config.get("min_booking_hours", {"car": 6, "bike": 1}),
+        "add_ons_pricing": pricing_config.get("add_ons_pricing", {"helmet": 50, "insurance": 199, "delivery": 299}),
     }
 
 
@@ -1103,7 +1145,12 @@ class PaymentConfirmRequest(BaseModel):
 
 
 async def _append_wallet_ledger(user_id: str, delta: float, reason: str, payment_id: str | None = None, ref_id: str | None = None, actor_id: str | None = None):
-    user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    # user_id can be a synthetic placeholder with no real account (e.g.
+    # marketplace-owned inventory's "usr_marketplace" owner_id fallback in
+    # create_booking) - treat as a 0 balance rather than crashing, so a real
+    # customer-side debit/credit elsewhere in the same flow still completes;
+    # the ledger entry itself is still written for audit purposes.
+    user = await db.users.find_one({"user_id": user_id}, {"_id": 0}) or {}
     new_balance = float(user.get("wallet_balance", 0)) + delta
     await db.users.update_one({"user_id": user_id}, {"$set": {"wallet_balance": new_balance}})
     await db.wallet_ledger.insert_one({
@@ -1168,7 +1215,11 @@ async def payments_create(payload: PaymentCreateRequest, user=Depends(get_curren
         # to pay less than what is actually owed for this payment's purpose -
         # the amount is otherwise fully client-supplied. A "deposit" purpose
         # owes the booking's deposit amount, not its full rental total.
-        floor = booking["deposit"] if payload.purpose == "deposit" else booking["total_amount"]
+        # `total_payable` (rental + platform fee + tax + add-ons, all computed
+        # server-side by PricingEngine) is the real floor for "booking" - a
+        # bare `total_amount` fallback covers bookings created before that
+        # field existed.
+        floor = booking["deposit"] if payload.purpose == "deposit" else booking.get("total_payable", booking["total_amount"])
         if payload.amount + 0.01 < floor:
             raise HTTPException(status_code=400, detail="Amount is less than the amount owed")
 
@@ -1283,18 +1334,36 @@ async def payments_confirm(payment_id: str, payload: PaymentConfirmRequest, user
         if p.get("booking_id"):
             booking = await db.bookings.find_one({"booking_id": p["booking_id"]}, {"_id": 0})
             if booking:
-                await db.bookings.update_one({"booking_id": p["booking_id"]}, {"$set": {"status": "confirmed"}})
-                miles_earned = int(booking["total_amount"] / 10)
-                await _append_miles_ledger(user["user_id"], miles_earned, "booking", ref_id=p["booking_id"])
-                await db.notifications.insert_one({
-                    "notification_id": "ntf_" + uuid.uuid4().hex[:10],
-                    "user_id": user["user_id"],
-                    "title": "Booking Confirmed",
-                    "body": f"Your {booking['vehicle_snapshot']['name']} is booked. +{miles_earned} RideMiles earned!",
-                    "type": "booking", "read": False, "created_at": utc_now(),
-                })
-                await publish_event(user["user_id"], "booking.confirmed", {"booking_id": p["booking_id"], "payment_id": payment_id})
-                await emit_domain_event("PaymentCompleted", {"payment_id": payment_id, "booking_id": p["booking_id"], "amount": p["amount"]}, user["user_id"])
+                booking_service = BookingService(
+                    db, utc_now,
+                    payment_gateway_factory=get_payment_gateway,
+                    wallet_ledger_appender=_append_wallet_ledger,
+                )
+                confirmed = await booking_service.confirm_paid_booking(booking, payment_id)
+                if confirmed:
+                    miles_earned = int(booking["total_amount"] / 10)
+                    await _append_miles_ledger(user["user_id"], miles_earned, "booking", ref_id=p["booking_id"])
+                    await db.notifications.insert_one({
+                        "notification_id": "ntf_" + uuid.uuid4().hex[:10],
+                        "user_id": user["user_id"],
+                        "title": "Booking Confirmed",
+                        "body": f"Your {booking['vehicle_snapshot']['name']} is booked. +{miles_earned} RideMiles earned!",
+                        "type": "booking", "read": False, "created_at": utc_now(),
+                    })
+                    await publish_event(user["user_id"], "booking.confirmed", {"booking_id": p["booking_id"], "payment_id": payment_id})
+                    await emit_domain_event("PaymentCompleted", {"payment_id": payment_id, "booking_id": p["booking_id"], "amount": p["amount"]}, user["user_id"])
+                else:
+                    # Vehicle was claimed by a conflicting confirmed/active booking
+                    # between create_booking and payment settling - the payment was
+                    # already refunded by confirm_paid_booking.
+                    await db.notifications.insert_one({
+                        "notification_id": "ntf_" + uuid.uuid4().hex[:10],
+                        "user_id": user["user_id"],
+                        "title": "Booking unavailable",
+                        "body": f"{booking['vehicle_snapshot']['name']} was booked by someone else first. Your payment has been refunded.",
+                        "type": "booking", "read": False, "created_at": utc_now(),
+                    })
+                    await publish_event(user["user_id"], "booking.confirm_failed", {"booking_id": p["booking_id"], "payment_id": payment_id})
         elif p["purpose"] == "wallet_topup":
             await _append_wallet_ledger(user["user_id"], p["amount"], "topup", payment_id=payment_id)
             await publish_event(user["user_id"], "wallet.topped_up", {"payment_id": payment_id, "amount": p["amount"]})
@@ -1551,8 +1620,16 @@ async def list_vehicles(
     min_rating: Optional[float] = None,
     available: Optional[bool] = True,
     instant_book: Optional[bool] = None,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
     user=Depends(get_current_user),
 ):
+    # Real coordinates supplied by the client (see frontend location capture
+    # flow) let us compute an actual haversine distance per vehicle instead of
+    # relying on the static `distance_km` baked into seed data. Without them
+    # (older client, or a user who hasn't set a location yet) we fall back to
+    # that static field exactly as before.
+    has_real_location = lat is not None and lng is not None
     query = {"available": available is not False}
     inferred_q = q.strip()[:100] if q else ""
     q_lower = inferred_q.lower()
@@ -1571,7 +1648,10 @@ async def list_vehicles(
         query["type"] = type
     if max_price is not None:
         query["price_per_day"] = {"$lte": max_price}
-    if max_distance is not None:
+    if max_distance is not None and not has_real_location:
+        # Real coordinates make the static seed distance_km meaningless as a
+        # DB-level filter — that case is filtered below using the computed
+        # real distance instead.
         query["distance_km"] = {"$lte": max_distance}
     if fuel_type:
         query["fuel_type"] = {"$regex": f"^{re.escape(fuel_type.strip())}$", "$options": "i"}
@@ -1593,6 +1673,11 @@ async def list_vehicles(
     cursor = db.vehicles.find(query, {"_id": 0})
     items = await cursor.to_list(200)
     for item in items:
+        if has_real_location and item.get("latitude") is not None and item.get("longitude") is not None:
+            # Real haversine distance from the user's real coordinates to this
+            # vehicle's real latitude/longitude — replaces the static seed
+            # distance_km for both the figure shown and any distance filter/sort.
+            item["distance_km"] = round(haversine_m(lat, lng, item["latitude"], item["longitude"]) / 1000.0, 2)
         verification = 100 if item.get("verification_status", "approved") == "approved" else 60
         rating_score = min(100, float(item.get("rating", 0)) * 20)
         history_score = min(100, int(item.get("trips", 0)) * 2)
@@ -1614,6 +1699,10 @@ async def list_vehicles(
             "inspection_status": "Clean latest inspection",
             "last_maintenance_date": item.get("last_maintenance_date", "2026-05-15"),
         }
+    if has_real_location and max_distance is not None:
+        # DB-level filtering was skipped above since it can't see the computed
+        # real distance — apply it here now that every item has one.
+        items = [item for item in items if item.get("distance_km", 999) <= max_distance]
     if sort == "price":
         items.sort(key=lambda v: v.get("price_per_day", 0))
     elif sort == "rating":
@@ -1741,10 +1830,37 @@ async def compare_vehicles(payload: CompareRequest, user=Depends(get_current_use
 
 
 # ---------- Bookings ----------
+@api_router.get("/vehicles/{vehicle_id}/price-preview")
+async def vehicle_price_preview(vehicle_id: str, plan: str, start_date: str, end_date: str, user=Depends(get_current_user)):
+    """What POST /bookings would actually charge for this vehicle/plan/date
+    range, computed the exact same way (see BookingService.price_estimate,
+    which calls the same PricingEngine.calculate_booking_price create_booking
+    itself uses) - a real preview, not a separate guess that could drift from
+    the real charge. Does not enforce the minimum-duration/minimum-notice
+    rules as hard errors (see `meets_minimum_duration`/`meets_minimum_notice`
+    in the response) so the booking screen can explain an invalid selection
+    instead of erroring mid-edit."""
+    vehicle = await db.vehicles.find_one({"vehicle_id": vehicle_id}, {"_id": 0})
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    if plan not in ("hourly", "daily", "weekly", "monthly"):
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    booking_service = BookingService(db, utc_now)
+    try:
+        return await booking_service.price_estimate(vehicle, plan, start_date, end_date)
+    except KeyError:
+        raise HTTPException(status_code=422, detail="This vehicle does not have a rate configured for that plan")
+
+
 @api_router.post("/bookings")
 async def create_booking(payload: BookingCreate, user=Depends(get_current_user)):
     check_rate_limit("booking_create", user)
-    booking_service = BookingService(db, utc_now, commission_service=CommissionService(db))
+    # No commission_service here: the 80/20 host/platform split on the base
+    # rental now comes from PricingEngine (admin-configurable via
+    # PricingConfigService), not CommissionService - that service still
+    # backs subscriptions, a separate product line this pricing model
+    # doesn't cover. See BookingService.create_booking.
+    booking_service = BookingService(db, utc_now)
     booking = await booking_service.create_booking(payload, user)
     await emit_domain_event("BookingCreated", {"booking_id": booking["booking_id"], "vehicle_id": booking["vehicle_id"]}, user["user_id"])
     return booking
@@ -1764,6 +1880,36 @@ async def get_booking(booking_id: str, user=Depends(get_current_user)):
     return b
 
 
+async def _early_checkin_calc(b: dict, at: datetime) -> dict:
+    original_rate = (b.get("pricing_breakdown") or {}).get("calculated_hourly_rate")
+    if original_rate is None:
+        start = datetime.fromisoformat(b["start_date"].replace("Z", "+00:00"))
+        end = datetime.fromisoformat(b["end_date"].replace("Z", "+00:00"))
+        hours = max(1 / 60, (end - start).total_seconds() / 3600)
+        original_rate = round(float(b["total_amount"]) / hours, 2)
+    config = await PricingConfigService(db).get_config()
+    scheduled_start = datetime.fromisoformat(b["start_date"].replace("Z", "+00:00"))
+    return PricingEngine.calculate_early_checkin(
+        original_hourly_rate=original_rate, scheduled_start=scheduled_start, actual_start=at, config=config,
+    )
+
+
+@api_router.get("/bookings/{booking_id}/early-checkin-preview")
+async def early_checkin_preview(booking_id: str, user=Depends(get_current_user)):
+    """What starting the trip right now would cost (if anything) - call this
+    before /start so the user sees the charge (spec: "must see the additional
+    charge before confirming") rather than discovering it only on commit."""
+    b = await db.bookings.find_one({"booking_id": booking_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not b:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    vehicle = await db.vehicles.find_one({"vehicle_id": b["vehicle_id"]}, {"_id": 0}) or {}
+    calc = await _early_checkin_calc(b, datetime.now(timezone.utc))
+    policy = vehicle.get("early_checkin_policy", "free_only")
+    calc["policy"] = policy
+    calc["allowed"] = calc["within_grace"] or policy == "paid_allowed"
+    return calc
+
+
 @api_router.post("/bookings/{booking_id}/start")
 async def start_trip(booking_id: str, user=Depends(get_current_user)):
     b = await db.bookings.find_one({"booking_id": booking_id, "user_id": user["user_id"]}, {"_id": 0})
@@ -1774,14 +1920,56 @@ async def start_trip(booking_id: str, user=Depends(get_current_user)):
     before = await db.inspections.find_one({"booking_id": booking_id, "phase": "before"}, {"_id": 0})
     if not before:
         raise HTTPException(status_code=422, detail="Before-trip inspection required")
+
+    # Early check-in authorization (spec: must never bypass KYC/payment/
+    # availability/inspection/host policy - this runs AFTER the checks above,
+    # never instead of them). Free within the configured grace period;
+    # beyond it, only if the vehicle's host has opted into paid early pickup,
+    # and only if the customer's wallet actually covers it.
+    now = datetime.now(timezone.utc)
+    early = await _early_checkin_calc(b, now)
+    early_checkin_id = None
+    if early.get("is_early"):
+        vehicle = await db.vehicles.find_one({"vehicle_id": b["vehicle_id"]}, {"_id": 0}) or {}
+        policy = vehicle.get("early_checkin_policy", "free_only")
+        if policy == "not_allowed":
+            raise HTTPException(status_code=403, detail="Early pickup is not allowed for this vehicle - please arrive at your scheduled pickup time")
+    if early["billable_hours"] > 0:
+        vehicle = await db.vehicles.find_one({"vehicle_id": b["vehicle_id"]}, {"_id": 0}) or {}
+        if vehicle.get("early_checkin_policy", "free_only") != "paid_allowed":
+            raise HTTPException(status_code=403, detail="Early pickup beyond the free grace period is not allowed for this vehicle")
+        fresh_user = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+        wallet_balance = float((fresh_user or {}).get("wallet_balance", 0))
+        if wallet_balance + 1e-9 < early["charge"]:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Insufficient wallet balance for early pickup (need ₹{early['charge']:.2f}, have ₹{wallet_balance:.2f}). Top up your wallet and try again.",
+            )
+        early_checkin_id = "eci_" + uuid.uuid4().hex[:12]
+        await _append_wallet_ledger(user["user_id"], -early["charge"], "early_checkin_charge", ref_id=early_checkin_id)
+        await _append_wallet_ledger(b["owner_id"], early["host_share"], "early_checkin_host_share", ref_id=early_checkin_id)
+        await db.early_checkins.insert_one({
+            "early_checkin_id": early_checkin_id, "booking_id": booking_id, "owner_id": b["owner_id"],
+            "user_id": user["user_id"], "scheduled_start": b["start_date"], "actual_start": now.isoformat(),
+            **early, "created_at": utc_now(),
+        })
+        await db.financial_ledger.insert_many([
+            {"ledger_id": "fl_" + uuid.uuid4().hex[:12], "booking_id": booking_id, "event_type": "EARLY_CHECKIN",
+             "amount": early["charge"], "party": "user", "created_at": utc_now(), "meta": {"early_checkin_id": early_checkin_id}},
+            {"ledger_id": "fl_" + uuid.uuid4().hex[:12], "booking_id": booking_id, "event_type": "EARLY_CHECKIN_HOST_SHARE",
+             "amount": early["host_share"], "party": "host", "created_at": utc_now(), "meta": {"early_checkin_id": early_checkin_id}},
+            {"ledger_id": "fl_" + uuid.uuid4().hex[:12], "booking_id": booking_id, "event_type": "EARLY_CHECKIN_PLATFORM_SHARE",
+             "amount": early["platform_share"], "party": "platform", "created_at": utc_now(), "meta": {"early_checkin_id": early_checkin_id}},
+        ])
+
     await db.bookings.update_one(
         {"booking_id": booking_id},
         {"$set": {"status": "active", "odometer_start": before["odometer_value"], "started_at": utc_now(),
-                  "inspection_before_id": before["inspection_id"]}}
+                  "inspection_before_id": before["inspection_id"], "early_checkin_id": early_checkin_id}}
     )
     await get_gps_provider().start_tracking(vehicle_id=b["vehicle_id"], booking_id=booking_id)
     await emit_domain_event("TripStarted", {"booking_id": booking_id}, user["user_id"])
-    return {"ok": True, "status": "active"}
+    return {"ok": True, "status": "active", "early_checkin": early if early["billable_hours"] > 0 else None}
 
 
 @api_router.post("/bookings/{booking_id}/end")
@@ -1796,11 +1984,53 @@ async def end_trip(booking_id: str, user=Depends(get_current_user)):
         raise HTTPException(status_code=422, detail="After-trip inspection required")
     odo_start = b.get("odometer_start") or 0
     miles_traveled = max(0, int(after["odometer_value"] - odo_start))
+
+    # Late return fee: original rate x 2 x ceil(late minutes/60), split 50/50
+    # host/platform. Unlike early check-in, this never blocks ending the
+    # trip - the vehicle must be returned regardless of whether the fee can
+    # be collected right now. Charged from the wallet when there's enough
+    # balance; otherwise recorded as due (same "amount not yet collected"
+    # pattern this codebase already uses for refund_due/extension_amount_due)
+    # rather than trapping the return.
+    now = datetime.now(timezone.utc)
+    scheduled_end = datetime.fromisoformat(b["end_date"].replace("Z", "+00:00"))
+    original_rate = (b.get("pricing_breakdown") or {}).get("calculated_hourly_rate")
+    if original_rate is None:
+        start_dt = datetime.fromisoformat(b["start_date"].replace("Z", "+00:00"))
+        hours = max(1 / 60, (scheduled_end - start_dt).total_seconds() / 3600)
+        original_rate = round(float(b["total_amount"]) / hours, 2)
+    pricing_config = await PricingConfigService(db).get_config()
+    late_calc = PricingEngine.calculate_late_fee(
+        original_hourly_rate=original_rate, scheduled_end=scheduled_end, actual_end=now, config=pricing_config,
+    )
+    late_fee_id = None
+    if late_calc["billable_hours"] > 0:
+        late_fee_id = "lf_" + uuid.uuid4().hex[:12]
+        fresh_user = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+        wallet_balance = float((fresh_user or {}).get("wallet_balance", 0))
+        collected = wallet_balance + 1e-9 >= late_calc["late_fee"]
+        if collected:
+            await _append_wallet_ledger(user["user_id"], -late_calc["late_fee"], "late_fee_charge", ref_id=late_fee_id)
+            await _append_wallet_ledger(b["owner_id"], late_calc["host_share"], "late_fee_host_share", ref_id=late_fee_id)
+        await db.late_fees.insert_one({
+            "late_fee_id": late_fee_id, "booking_id": booking_id, "owner_id": b["owner_id"], "user_id": user["user_id"],
+            "scheduled_return": b["end_date"], "actual_return": now.isoformat(),
+            **late_calc, "payment_status": "paid" if collected else "due", "created_at": utc_now(),
+        })
+        await db.financial_ledger.insert_many([
+            {"ledger_id": "fl_" + uuid.uuid4().hex[:12], "booking_id": booking_id, "event_type": "LATE_FEE",
+             "amount": late_calc["late_fee"], "party": "user", "created_at": utc_now(), "meta": {"late_fee_id": late_fee_id, "payment_status": "paid" if collected else "due"}},
+            {"ledger_id": "fl_" + uuid.uuid4().hex[:12], "booking_id": booking_id, "event_type": "LATE_FEE_HOST_SHARE",
+             "amount": late_calc["host_share"], "party": "host", "created_at": utc_now(), "meta": {"late_fee_id": late_fee_id, "collected": collected}},
+            {"ledger_id": "fl_" + uuid.uuid4().hex[:12], "booking_id": booking_id, "event_type": "LATE_FEE_PLATFORM_SHARE",
+             "amount": late_calc["platform_share"], "party": "platform", "created_at": utc_now(), "meta": {"late_fee_id": late_fee_id, "collected": collected}},
+        ])
+
     await db.bookings.update_one(
         {"booking_id": booking_id},
         {"$set": {"status": "completed", "odometer_end": after["odometer_value"],
                   "ended_at": utc_now(), "inspection_after_id": after["inspection_id"],
-                  "miles_earned": miles_traveled}}
+                  "miles_earned": miles_traveled, "late_fee_id": late_fee_id}}
     )
     await _append_miles_ledger(user["user_id"], miles_traveled, "distance", ref_id=booking_id)
     await get_gps_provider().stop_tracking(vehicle_id=b["vehicle_id"], booking_id=booking_id)
@@ -1823,7 +2053,8 @@ async def end_trip(booking_id: str, user=Depends(get_current_user)):
     await emit_domain_event("PayoutCreated", {"booking_id": booking_id, "payout_id": payout["payout_id"], "net_amount": payout["net_amount"]}, b["owner_id"])
     return {"ok": True, "status": "completed", "miles_earned": miles_traveled, "distance_km": miles_traveled,
             "ai_verdict": (after.get("damage_comparison") or {}).get("verdict", "clean"),
-            "payout_id": payout["payout_id"], "milestones_reached": [m["milestone_km"] for m in milestone_events]}
+            "payout_id": payout["payout_id"], "milestones_reached": [m["milestone_km"] for m in milestone_events],
+            "late_fee": late_calc if late_calc["billable_hours"] > 0 else None}
 
 
 @api_router.post("/bookings/{booking_id}/cancel")
@@ -1838,7 +2069,10 @@ async def cancel_booking(booking_id: str, payload: BookingCancelRequest, user=De
 @api_router.post("/bookings/{booking_id}/extend")
 async def extend_booking(booking_id: str, payload: BookingExtendRequest, user=Depends(get_current_user)):
     check_rate_limit("booking_extend", user)
-    return await BookingService(db, utc_now).extend_booking(booking_id, payload, user)
+    booking_service = BookingService(db, utc_now, wallet_ledger_appender=_append_wallet_ledger)
+    result = await booking_service.extend_booking(booking_id, payload, user)
+    await emit_domain_event("BookingExtended", {"booking_id": booking_id, "extension_id": result["extension"]["extension_id"]}, user["user_id"])
+    return result
 
 
 @api_router.get("/bookings/{booking_id}/invoice")
@@ -1867,6 +2101,20 @@ async def validate_coupon(payload: CouponValidateRequest, user=Depends(get_curre
         discount = min(float(coupon["value"]), payload.amount)
     result = {"code": code, "valid": True, "discount": discount, "payable": round(payload.amount - discount, 2)}
     await emit_domain_event("CouponRedeemed", {"code": code, "discount": discount}, user["user_id"] if isinstance(user, dict) else None)
+    return result
+
+
+@api_router.get("/coupons")
+async def list_coupons(user=Depends(get_current_user)):
+    now_iso = utc_now()
+    items = await db.coupons.find({"active": True}, {"_id": 0}).to_list(200)
+    fields = ["code", "description", "type", "value", "max_discount", "min_amount", "expires_at"]
+    result = []
+    for coupon in items:
+        expires_at = coupon.get("expires_at")
+        if expires_at and expires_at < now_iso:
+            continue
+        result.append({field: coupon.get(field) for field in fields})
     return result
 
 
@@ -2017,6 +2265,20 @@ async def vehicle_location(vehicle_id: str, user=Depends(get_current_user)):
     v = await db.vehicles.find_one({"vehicle_id": vehicle_id}, {"_id": 0})
     if not v:
         raise HTTPException(status_code=404, detail="Vehicle not found")
+    # Live GPS is sensitive - only the vehicle's owner, an admin, or a rider
+    # with a currently active/confirmed booking on it may read it. Without
+    # this, any signed-in user could poll another rider's live position by
+    # guessing/enumerating vehicle_id.
+    user_roles = user.get("roles") or [user.get("role", "customer")]
+    is_privileged = "admin" in user_roles or v.get("owner_id") == user["user_id"]
+    if not is_privileged:
+        has_booking = await db.bookings.find_one({
+            "vehicle_id": vehicle_id,
+            "user_id": user["user_id"],
+            "status": {"$in": ["confirmed", "active"]},
+        }, {"_id": 0, "booking_id": 1})
+        if not has_booking:
+            raise HTTPException(status_code=403, detail="Not authorized to view this vehicle's location")
     return {
         "vehicle_id": vehicle_id,
         "lat": v.get("last_track_lat") or v["latitude"],
@@ -2135,14 +2397,14 @@ class VehicleCreate(BaseModel):
     brand: str
     model: str
     image: str
-    price_per_hour: float
-    price_per_day: float
-    price_per_week: float
-    price_per_month: float
-    deposit: float
+    price_per_hour: float = Field(gt=0)
+    price_per_day: float = Field(gt=0)
+    price_per_week: float = Field(gt=0)
+    price_per_month: float = Field(gt=0)
+    deposit: float = Field(ge=0)
     transmission: str
     fuel_type: str
-    seats: int
+    seats: int = Field(gt=0)
     location: str
     latitude: float = 19.0760
     longitude: float = 72.8777
@@ -2200,7 +2462,9 @@ async def owner_my_vehicles(user=Depends(get_current_user)):
 @api_router.patch("/owner/vehicles/{vehicle_id}")
 async def owner_update_vehicle(vehicle_id: str, body: dict, user=Depends(get_current_user)):
     _require_role(user, "owner")
-    allowed = {k: v for k, v in body.items() if k in ("price_per_hour", "price_per_day", "price_per_week", "price_per_month", "available", "description", "deposit")}
+    allowed = {k: v for k, v in body.items() if k in ("price_per_hour", "price_per_day", "price_per_week", "price_per_month", "available", "description", "deposit", "early_checkin_policy")}
+    if "early_checkin_policy" in allowed and allowed["early_checkin_policy"] not in ("not_allowed", "free_only", "paid_allowed"):
+        raise HTTPException(status_code=400, detail="Invalid early_checkin_policy")
     if not allowed:
         raise HTTPException(status_code=400, detail="No valid fields")
     vehicle = await db.vehicles.find_one({"vehicle_id": vehicle_id, "owner_id": user["user_id"]}, {"_id": 0})
@@ -2248,6 +2512,33 @@ async def owner_earnings(user=Depends(get_current_user)):
         "active_trips": by_status.get("active", 0),
         "future_bookings": by_status.get("confirmed", 0),
     }
+
+
+@api_router.get("/owner/extension-earnings")
+async def owner_extension_earnings(user=Depends(get_current_user)):
+    """Owner-scoped view of real booking extension payouts (see
+    BookingService.extend_booking, which inserts one db.booking_extensions
+    document per paid extension and credits the host's wallet with
+    host_extension_payout). Mirrors owner_payouts' pagination pattern."""
+    _require_role(user, "owner")
+    items = await db.booking_extensions.find({"owner_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
+    total_earned = round(sum(float(item.get("host_extension_payout") or 0) for item in items), 2)
+    return {"items": items, "total_earned": total_earned, "count": len(items)}
+
+
+@api_router.get("/owner/late-fee-earnings")
+async def owner_late_fee_earnings(user=Depends(get_current_user)):
+    """Owner-scoped view of real late-return fee shares (see server.end_trip,
+    which inserts one db.late_fees document per late return and credits the
+    host's wallet with host_share only when payment_status == "paid"). All
+    records are returned (including payment_status == "due") so the UI can
+    show pending amounts too, but total_earned only counts fees actually
+    collected."""
+    _require_role(user, "owner")
+    items = await db.late_fees.find({"owner_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
+    total_earned = round(sum(float(item.get("host_share") or 0) for item in items if item.get("payment_status") == "paid"), 2)
+    total_due = round(sum(float(item.get("host_share") or 0) for item in items if item.get("payment_status") != "paid"), 2)
+    return {"items": items, "total_earned": total_earned, "total_due": total_due, "count": len(items)}
 
 
 @api_router.get("/owner/payouts")
@@ -2370,6 +2661,101 @@ async def update_commission_config(payload: CommissionConfigUpdate, user=Depends
     return updated
 
 
+class PricingConfigUpdate(BaseModel):
+    """Partial update - every field optional, only supplied keys change.
+    See raidex_platform/pricing_engine.py DEFAULT_CONFIG for the full shape
+    and what each field controls."""
+    min_booking_hours: Optional[dict[str, float]] = None
+    min_notice_hours: Optional[float] = Field(default=None, gt=0)
+    duration_curve: Optional[dict[str, float]] = None
+    lead_time_curve: Optional[dict[str, float]] = None
+    factor_weights: Optional[dict[str, float]] = None
+    platform_fee_pct: Optional[float] = Field(default=None, ge=0, le=1)
+    host_payout_pct: Optional[float] = Field(default=None, ge=0, le=1)
+    tax: Optional[dict[str, Any]] = None
+    early_checkin_grace_minutes: Optional[float] = Field(default=None, ge=0)
+    late_fee_multiplier: Optional[float] = Field(default=None, ge=1)
+    late_fee_split: Optional[dict[str, float]] = None
+    early_checkin_split: Optional[dict[str, float]] = None
+    price_lock_minutes: Optional[float] = Field(default=None, gt=0)
+    add_ons_pricing: Optional[dict[str, float]] = None
+
+
+@api_router.get("/admin/pricing-config")
+async def get_pricing_config(user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    return await PricingConfigService(db).get_config()
+
+
+@api_router.put("/admin/pricing-config")
+async def update_pricing_config(payload: PricingConfigUpdate, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    check_rate_limit("pricing_config_update", user)
+    service = PricingConfigService(db)
+    before = await service.get_config()
+    updates = payload.model_dump(exclude_unset=True, exclude_none=True)
+    updated = await service.set_config(updates, updated_by=user["user_id"], now=utc_now())
+    await AuditLogger(db).log(
+        actor_id=user["user_id"], action="pricing_config.update",
+        target_type="platform_config", target_id="pricing",
+        before=before, after=updated,
+    )
+    await db.admin_audit.insert_one({
+        "audit_id": "aud_" + uuid.uuid4().hex[:10], "admin_id": user["user_id"],
+        "action": "pricing_config.update", "target_type": "platform_config", "target_id": "pricing",
+        "before_state": before, "after_state": updated, "created_at": utc_now(),
+    })
+    return updated
+
+
+class VehiclePricingUpdate(BaseModel):
+    min_hourly_rate: float = Field(gt=0)
+    max_hourly_rate: float = Field(gt=0)
+
+
+@api_router.patch("/admin/vehicles/{vehicle_id}/pricing")
+async def admin_update_vehicle_pricing(vehicle_id: str, payload: VehiclePricingUpdate, user=Depends(get_current_user)):
+    """The per-vehicle half of admin pricing control: min/max hourly rate.
+    (The global rules - duration curve, lead-time curve, fees, tax, payout
+    split, etc - live in /admin/pricing-config above.)"""
+    _require_role(user, "admin")
+    if payload.min_hourly_rate > payload.max_hourly_rate:
+        raise HTTPException(status_code=400, detail="min_hourly_rate cannot exceed max_hourly_rate")
+    vehicle = await db.vehicles.find_one({"vehicle_id": vehicle_id}, {"_id": 0})
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    before = {"min_hourly_rate": vehicle.get("min_hourly_rate"), "max_hourly_rate": vehicle.get("max_hourly_rate")}
+    after = {"min_hourly_rate": payload.min_hourly_rate, "max_hourly_rate": payload.max_hourly_rate}
+    await db.vehicles.update_one({"vehicle_id": vehicle_id}, {"$set": after})
+    await db.admin_audit.insert_one({
+        "audit_id": "aud_" + uuid.uuid4().hex[:10], "admin_id": user["user_id"],
+        "action": "vehicle.pricing_update", "target_type": "vehicle", "target_id": vehicle_id,
+        "before_state": before, "after_state": after, "created_at": utc_now(),
+    })
+    return {**vehicle, **after}
+
+
+class PricingSimulateRequest(BaseModel):
+    vehicle_id: str
+    start_date: str
+    end_date: str
+
+
+@api_router.post("/admin/pricing-simulate")
+async def admin_pricing_simulate(payload: PricingSimulateRequest, user=Depends(get_current_user)):
+    """RaideX Admin Price Simulator: runs the exact same PricingEngine calc a
+    real booking of this vehicle/date-range would produce (calling the same
+    BookingService.price_estimate a customer's preview uses), so admins can
+    see the effect of a pricing-config or vehicle-rate-range change before
+    real customers do."""
+    _require_role(user, "admin")
+    vehicle = await db.vehicles.find_one({"vehicle_id": payload.vehicle_id}, {"_id": 0})
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    booking_service = BookingService(db, utc_now)
+    return await booking_service.price_estimate(vehicle, "hourly", payload.start_date, payload.end_date)
+
+
 @api_router.get("/admin/kpis")
 async def admin_kpis(user=Depends(get_current_user)):
     _require_role(user, "admin")
@@ -2454,6 +2840,50 @@ async def admin_payments(status: Optional[str] = None, user=Depends(get_current_
         filt["status"] = status
     items = await db.payments.find(filt, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
     return items
+
+
+@api_router.post("/admin/coupons")
+async def admin_create_coupon(payload: CouponCreate, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    code = payload.code.strip().upper()
+    existing = await db.coupons.find_one({"code": code}, {"_id": 0})
+    if existing:
+        raise HTTPException(status_code=409, detail="Coupon code already exists")
+    doc = payload.model_dump()
+    doc["code"] = code
+    doc["created_at"] = utc_now()
+    await db.coupons.insert_one(doc)
+    await db.admin_audit.insert_one({"audit_id": "aud_" + uuid.uuid4().hex[:10], "admin_id": user["user_id"],
+                                      "action": "coupon.create", "target_type": "coupon", "target_id": code,
+                                      "before_state": None, "after_state": {k: v for k, v in doc.items() if k != "_id"},
+                                      "created_at": utc_now()})
+    doc.pop("_id", None)
+    return doc
+
+
+@api_router.get("/admin/coupons")
+async def admin_list_coupons(user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    items = await db.coupons.find({}, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
+    return items
+
+
+@api_router.patch("/admin/coupons/{code}")
+async def admin_update_coupon(code: str, payload: CouponUpdate, user=Depends(get_current_user)):
+    _require_role(user, "admin")
+    code = code.strip().upper()
+    existing = await db.coupons.find_one({"code": code}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Coupon not found")
+    updates = payload.model_dump(exclude_unset=True)
+    if updates:
+        await db.coupons.update_one({"code": code}, {"$set": updates})
+    updated = await db.coupons.find_one({"code": code}, {"_id": 0})
+    await db.admin_audit.insert_one({"audit_id": "aud_" + uuid.uuid4().hex[:10], "admin_id": user["user_id"],
+                                      "action": "coupon.update", "target_type": "coupon", "target_id": code,
+                                      "before_state": existing, "after_state": updated,
+                                      "created_at": utc_now()})
+    return updated
 
 
 class PayoutMarkPaidRequest(BaseModel):
@@ -3124,19 +3554,32 @@ async def razorpay_webhook(request: Request):
                 if payment.get("booking_id"):
                     booking = await db.bookings.find_one({"booking_id": payment["booking_id"]}, {"_id": 0})
                     if booking:
-                        await db.bookings.update_one(
-                            {"booking_id": payment["booking_id"]},
-                            {"$set": {"status": "confirmed"}}
+                        booking_service = BookingService(
+                            db, utc_now,
+                            payment_gateway_factory=get_payment_gateway,
+                            wallet_ledger_appender=_append_wallet_ledger,
                         )
-                        miles_earned = int(booking["total_amount"] / 10)
-                        await _append_miles_ledger(payment["user_id"], miles_earned, "booking", ref_id=payment["booking_id"])
-                        await db.notifications.insert_one({
-                            "notification_id": "ntf_" + uuid.uuid4().hex[:10],
-                            "user_id": payment["user_id"],
-                            "title": "Booking Confirmed",
-                            "body": f"Your {booking['vehicle_snapshot']['name']} is booked. +{miles_earned} RideMiles!",
-                            "type": "booking", "read": False, "created_at": utc_now(),
-                        })
+                        confirmed = await booking_service.confirm_paid_booking(booking, payment["payment_id"])
+                        if confirmed:
+                            miles_earned = int(booking["total_amount"] / 10)
+                            await _append_miles_ledger(payment["user_id"], miles_earned, "booking", ref_id=payment["booking_id"])
+                            await db.notifications.insert_one({
+                                "notification_id": "ntf_" + uuid.uuid4().hex[:10],
+                                "user_id": payment["user_id"],
+                                "title": "Booking Confirmed",
+                                "body": f"Your {booking['vehicle_snapshot']['name']} is booked. +{miles_earned} RideMiles!",
+                                "type": "booking", "read": False, "created_at": utc_now(),
+                            })
+                        else:
+                            # Same conflict handling as the client-confirm path -
+                            # payment already refunded by confirm_paid_booking.
+                            await db.notifications.insert_one({
+                                "notification_id": "ntf_" + uuid.uuid4().hex[:10],
+                                "user_id": payment["user_id"],
+                                "title": "Booking unavailable",
+                                "body": f"{booking['vehicle_snapshot']['name']} was booked by someone else first. Your payment has been refunded.",
+                                "type": "booking", "read": False, "created_at": utc_now(),
+                            })
 
     await db.webhook_events.update_one({"event_id": event_id, "provider": "razorpay"}, {"$set": {"processed": True, "processed_at": utc_now()}})
     return {"ok": True}
@@ -3251,6 +3694,7 @@ async def create_indexes(target_db) -> None:
     await target_db.disputes.create_index([("status", 1), ("created_at", -1)])
     await target_db.referrals.create_index([("referrer_user_id", 1), ("referred_email", 1)], unique=True)
     await target_db.coupons.create_index("code", unique=True)
+    await target_db.coupons.create_index("active")
     await target_db.media_assets.create_index([("user_id", 1), ("created_at", -1)])
     await target_db.media_assets.create_index("asset_id", unique=True)
 
@@ -3341,7 +3785,8 @@ def _schedule_owner_anomaly_cron():
 
         scheduler = AsyncIOScheduler(timezone="UTC")
         scheduler.add_job(
-            lambda: asyncio.create_task(run_owner_anomaly_cron(db)),
+            run_owner_anomaly_cron,
+            args=[db],
             trigger="cron",
             hour=3,
             minute=30,
@@ -3382,7 +3827,8 @@ def _schedule_background_jobs():
                 continue
             handler_name = job["handler"]
             scheduler.add_job(
-                (lambda hn=handler_name: asyncio.create_task(run_job(db, runner, hn))),
+                run_job,
+                args=[db, runner, handler_name],
                 id=job["name"],
                 replace_existing=True,
                 misfire_grace_time=1800,

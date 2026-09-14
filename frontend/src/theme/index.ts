@@ -53,37 +53,63 @@ export const palette = {
     accent: "#05C46B",
     accentBg: "#E8F8F0",
     onAccentBg: "#037A42",
+    gold: "#B8860B",
+    goldBg: "#FBF1DC",
+    info: "#3B82F6",
+    infoBg: "#EAF2FE",
+    onInfoBg: "#1D4ED8",
     success: "#05C46B",
     warning: "#F59E0B",
     error: "#EF4444",
     border: "#E4E4E7",
     borderStrong: "#A1A1AA",
     overlay: "rgba(0,0,0,0.45)",
+    heroGradient: ["#111111", "#111111"] as [string, string],
+    cardGradient: ["#FFFFFF", "#F4F4F5"] as [string, string],
+    glow: "rgba(5,196,107,0.18)",
   },
+  // "Premium dark" is RAIDEX's brand identity, not a system-driven fallback -
+  // layered charcoal (never pure #000, which reads flat/basic on-screen and
+  // swallows shadows) with an emerald primary accent and a warm gold secondary
+  // accent reserved for rating/premium-tier moments, so the palette has two
+  // distinct highlight colors instead of one accent doing all the work.
   dark: {
-    surface: "#000000",
-    surface2: "#18181B",
-    surface3: "#27272A",
-    onSurface: "#FFFFFF",
-    onSurface2: "#A1A1AA",
-    onSurface3: "#D4D4D8",
-    inverse: "#FFFFFF",
-    onInverse: "#111111",
-    accent: "#05C46B",
-    accentBg: "#03331C",
-    onAccentBg: "#34D399",
-    success: "#05C46B",
-    warning: "#FBBF24",
-    error: "#F87171",
-    border: "#27272A",
-    borderStrong: "#52525B",
-    overlay: "rgba(0,0,0,0.7)",
+    surface: "#0A0A0E",
+    surface2: "#16161D",
+    surface3: "#202029",
+    onSurface: "#F5F5F7",
+    onSurface2: "#ABABB8",
+    onSurface3: "#77778A",
+    inverse: "#F5F5F7",
+    onInverse: "#0A0A0E",
+    accent: "#22D98B",
+    accentBg: "#0F2E22",
+    onAccentBg: "#5CEBAE",
+    gold: "#F0B84C",
+    goldBg: "#2E2410",
+    info: "#5B9BF7",
+    infoBg: "#132A4D",
+    onInfoBg: "#8FBBFA",
+    success: "#22D98B",
+    warning: "#F0B84C",
+    error: "#FF6B6B",
+    border: "#242430",
+    borderStrong: "#38384A",
+    overlay: "rgba(0,0,0,0.78)",
+    heroGradient: ["#0A0A0E", "#161622"] as [string, string],
+    cardGradient: ["#181820", "#111116"] as [string, string],
+    glow: "rgba(34,217,139,0.22)",
   },
 };
 
 export type Theme = typeof palette.light;
 
+// RAIDEX ships as a single premium-dark experience by design (see palette.dark
+// comment) rather than following the OS light/dark switch, so this ignores
+// useColorScheme on purpose - kept as a param-free hook (not a plain export)
+// so every call site still re-renders correctly and a per-user toggle can be
+// wired in later without touching every screen.
 export function useTheme(): Theme {
-  const scheme = useColorScheme();
-  return scheme === "dark" ? palette.dark : palette.light;
+  useColorScheme();
+  return palette.dark;
 }

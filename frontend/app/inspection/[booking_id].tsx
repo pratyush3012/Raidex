@@ -14,9 +14,10 @@ import Animated, {
   withDelay,
   Easing,
 } from "react-native-reanimated";
+import { format } from "date-fns";
 import { useTheme, tokens } from "@/src/theme";
 import { api } from "@/src/api/client";
-import { RaidexButton, RaidexChip, RaidexInput } from "@/src/components/ui";
+import { RaidexButton, RaidexChip, RaidexInput, RaidexModal } from "@/src/components/ui";
 
 type Phase = "before" | "after";
 const ANGLES = [
@@ -68,7 +69,29 @@ async function captureOrPickImg(): Promise<string | null> {
   return `data:image/jpeg;base64,${r.assets[0].base64}`;
 }
 
-type CompletionData = { distance_km: number; miles_earned: number; ai_verdict: string };
+type LateFee = {
+  billable_hours: number;
+  original_hourly_rate: number;
+  late_fee_multiplier: number;
+  late_fee: number;
+  host_share: number;
+  platform_share: number;
+} | null;
+
+type CompletionData = { distance_km: number; miles_earned: number; ai_verdict: string; late_fee?: LateFee };
+
+// What GET /bookings/{id}/early-checkin-preview returns.
+type EarlyPreview = {
+  is_early: boolean;
+  billable_hours: number;
+  within_grace: boolean;
+  charge: number;
+  host_share: number;
+  platform_share: number;
+  policy: "not_allowed" | "free_only" | "paid_allowed";
+  allowed: boolean;
+  original_hourly_rate?: number;
+};
 
 export default function Inspection() {
   const { booking_id, phase: ph } = useLocalSearchParams<{ booking_id: string; phase: Phase }>();
@@ -82,6 +105,31 @@ export default function Inspection() {
   const [notes, setNotes] = useState("");
   const [busy, setBusy] = useState(false);
   const [completion, setCompletion] = useState<CompletionData | null>(null);
+
+  // Early check-in: only relevant on the before-trip inspection, and only
+  // when the customer has shown up ahead of the scheduled pickup time.
+  const [booking, setBooking] = useState<any>(null);
+  const [earlyPreview, setEarlyPreview] = useState<EarlyPreview | null>(null);
+  const [earlyConfirmOpen, setEarlyConfirmOpen] = useState(false);
+  const [earlyConfirmed, setEarlyConfirmed] = useState(false);
+
+  useEffect(() => {
+    if (phase !== "before") return;
+    (async () => {
+      try {
+        const b = await api<any>(`/bookings/${booking_id}`);
+        setBooking(b);
+        const scheduledStart = b?.start_date ? new Date(b.start_date) : null;
+        if (scheduledStart && scheduledStart.getTime() > Date.now()) {
+          const preview = await api<EarlyPreview>(`/bookings/${booking_id}/early-checkin-preview`);
+          setEarlyPreview(preview);
+        }
+      } catch {
+        // Non-fatal — if this fails, the flow just proceeds as a normal
+        // (non-early) pickup and /start enforces the real rules server-side.
+      }
+    })();
+  }, [phase, booking_id]);
 
   const capturedCount = Object.values(photos).filter(Boolean).length;
   const allReq = capturedCount >= 4 && odo && parseFloat(odo) > 0;
@@ -110,8 +158,25 @@ export default function Inspection() {
     }
   };
 
+  // Beyond the free grace period, with the host not opting into paid early
+  // pickup: the host's policy simply doesn't allow starting early at all —
+  // don't offer it, block the submit button, and let the customer proceed
+  // normally once the scheduled pickup time arrives.
+  const earlyBeyondGraceBlocked =
+    phase === "before" && !!earlyPreview?.is_early && !earlyPreview.within_grace && earlyPreview.policy !== "paid_allowed";
+  // Beyond grace, but the host allows paid early pickup: real charge, real
+  // confirmation required before /start is ever called.
+  const earlyPaidRequiresConfirm =
+    phase === "before" && !!earlyPreview?.is_early && !earlyPreview.within_grace && earlyPreview.policy === "paid_allowed" && !earlyConfirmed;
+
   const submit = async () => {
     if (!allReq) { Alert.alert("Incomplete", "Capture at least 4 angles and enter odometer."); return; }
+    if (earlyBeyondGraceBlocked) return;
+    if (earlyPaidRequiresConfirm) { setEarlyConfirmOpen(true); return; }
+    await doSubmit();
+  };
+
+  const doSubmit = async () => {
     setBusy(true);
     try {
       await api("/inspections", {
@@ -125,12 +190,32 @@ export default function Inspection() {
         },
       });
       if (phase === "before") {
-        await api(`/bookings/${booking_id}/start`, { method: "POST" });
-        router.replace(`/trip/${booking_id}` as any);
+        try {
+          await api(`/bookings/${booking_id}/start`, { method: "POST" });
+          router.replace(`/trip/${booking_id}` as any);
+        } catch (e: any) {
+          // The inspection is already recorded — only the early-checkin
+          // authorization/charge failed, e.g. the situation changed between
+          // the preview and this confirm (host policy, or wallet balance).
+          if (e?.status === 403) {
+            Alert.alert("Early pickup not allowed", e.message || "This vehicle's host does not allow early pickup right now.");
+          } else if (e?.status === 402) {
+            Alert.alert(
+              "Insufficient wallet balance",
+              e.message || "Your wallet balance can't cover the early pickup charge.",
+              [
+                { text: "Top up wallet", onPress: () => router.push("/wallet" as any) },
+                { text: "Cancel", style: "cancel" },
+              ]
+            );
+          } else {
+            Alert.alert("Could not start trip", e?.message || "Please try again.");
+          }
+        }
       } else {
         const r = await api<any>(`/bookings/${booking_id}/end`, { method: "POST" });
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        setCompletion({ distance_km: r.distance_km, miles_earned: r.miles_earned, ai_verdict: r.ai_verdict });
+        setCompletion({ distance_km: r.distance_km, miles_earned: r.miles_earned, ai_verdict: r.ai_verdict, late_fee: r.late_fee ?? null });
       }
     } catch (e: any) {
       Alert.alert("Failed", e.message);
@@ -161,6 +246,47 @@ export default function Inspection() {
               : "Upload at least 4 angles. AI uses these to detect damage between rental phases."}
           </Text>
         </View>
+
+        {phase === "before" && earlyPreview?.is_early && (() => {
+          const scheduledStart = booking?.start_date ? new Date(booking.start_date) : null;
+          const earlyMs = scheduledStart ? Math.max(0, scheduledStart.getTime() - Date.now()) : 0;
+          const earlyH = Math.floor(earlyMs / 3_600_000);
+          const earlyM = Math.floor((earlyMs % 3_600_000) / 60_000);
+          const earlyLabel = `${earlyH}h ${earlyM}m`;
+
+          if (earlyPreview.within_grace) {
+            return (
+              <View testID="early-checkin-free-banner" style={[styles.banner, { backgroundColor: c.accentBg }]}>
+                <Ionicons name="time-outline" size={16} color={c.onAccentBg} />
+                <Text style={{ color: c.onAccentBg, fontSize: 12, flex: 1 }}>
+                  Early pickup available (free, {earlyLabel} early)
+                </Text>
+              </View>
+            );
+          }
+          if (earlyPreview.policy === "paid_allowed") {
+            return (
+              <View testID="early-checkin-paid-banner" style={[styles.banner, { backgroundColor: "rgba(240,184,76,0.14)" }]}>
+                <Ionicons name="alert-circle-outline" size={16} color={c.warning} />
+                <Text style={{ color: c.onSurface, fontSize: 12, flex: 1 }}>
+                  You're {earlyLabel} early — starting now costs a one-time charge of{" "}
+                  <Text style={{ fontWeight: "800" }}>₹{earlyPreview.charge.toFixed(2)}</Text>, billed from your wallet.
+                  You'll be asked to confirm before starting.
+                </Text>
+              </View>
+            );
+          }
+          return (
+            <View testID="early-checkin-blocked-banner" style={[styles.banner, { backgroundColor: c.surface2, borderWidth: 1, borderColor: c.border }]}>
+              <Ionicons name="lock-closed-outline" size={16} color={c.onSurface3} />
+              <Text style={{ color: c.onSurface2, fontSize: 12, flex: 1 }}>
+                Early pickup isn't available for this vehicle. Your scheduled pickup is{" "}
+                {scheduledStart ? format(scheduledStart, "h:mm a") : "later"} — please come back then to start your trip.
+              </Text>
+            </View>
+          );
+        })()}
+
         <Text style={[styles.h, { color: c.onSurface }]}>Photos</Text>
         <View style={styles.grid}>
           {ANGLES.map((a) => (
@@ -211,11 +337,42 @@ export default function Inspection() {
             icon={phase === "before" ? "play" : "stop"}
             iconPosition="leading"
             loading={busy}
-            disabled={!allReq}
+            disabled={!allReq || earlyBeyondGraceBlocked}
             onPress={submit}
           />
         </View>
       </ScrollView>
+
+      <RaidexModal
+        testID="early-checkin-confirm-modal"
+        visible={earlyConfirmOpen}
+        title="Confirm early pickup charge"
+        subtitle="This vehicle's host allows early pickup for a fee, charged immediately from your wallet."
+        onDismiss={() => setEarlyConfirmOpen(false)}
+        primaryLabel={`Confirm & pay ₹${earlyPreview?.charge?.toFixed?.(2) ?? "0.00"}`}
+        onPrimary={() => {
+          setEarlyConfirmed(true);
+          setEarlyConfirmOpen(false);
+          doSubmit();
+        }}
+        primaryTestID="early-checkin-confirm-btn"
+        dismissTestID="early-checkin-cancel-btn"
+      >
+        <View style={{ gap: 8 }}>
+          <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+            <Text style={{ color: c.onSurface3, fontSize: 13 }}>Early hours</Text>
+            <Text style={{ color: c.onSurface, fontSize: 13, fontWeight: "700" }}>{earlyPreview?.billable_hours}</Text>
+          </View>
+          <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+            <Text style={{ color: c.onSurface3, fontSize: 13 }}>Rate</Text>
+            <Text style={{ color: c.onSurface, fontSize: 13, fontWeight: "700" }}>₹{earlyPreview?.original_hourly_rate?.toFixed?.(2)}/hr</Text>
+          </View>
+          <View style={{ flexDirection: "row", justifyContent: "space-between", borderTopWidth: 1, borderTopColor: c.border, paddingTop: 8 }}>
+            <Text style={{ color: c.onSurface3, fontSize: 13 }}>Total charge</Text>
+            <Text style={{ color: c.onSurface, fontSize: 14, fontWeight: "800" }}>₹{earlyPreview?.charge?.toFixed?.(2)}</Text>
+          </View>
+        </View>
+      </RaidexModal>
 
       <TripCompletionReveal
         visible={!!completion}
@@ -395,6 +552,15 @@ function TripCompletionReveal({
                 <Text testID="completion-ai-verdict" style={{ color: c.onSurface2, fontSize: 13, flex: 1 }}>AI: {data.ai_verdict}</Text>
               </View>
             )}
+            {!!data?.late_fee && (
+              <View testID="completion-late-fee" style={{ flexDirection: "row", alignItems: "flex-start", gap: 8, backgroundColor: "rgba(240,184,76,0.14)", borderRadius: tokens.radius.md, padding: 12, marginTop: 12, width: "100%" }}>
+                <Ionicons name="alert-circle-outline" size={16} color={c.warning} style={{ marginTop: 1 }} />
+                <Text style={{ color: c.onSurface, fontSize: 13, flex: 1, lineHeight: 18 }}>
+                  A late fee of <Text style={{ fontWeight: "800" }}>₹{data.late_fee.late_fee.toFixed(2)}</Text> applies for
+                  returning {data.late_fee.billable_hours} hour{data.late_fee.billable_hours === 1 ? "" : "s"} late.
+                </Text>
+              </View>
+            )}
             <View style={{ marginTop: 22, width: "100%" }}>
               <RaidexButton testID="trip-completion-done" label="Done" onPress={onDone} />
             </View>
@@ -409,4 +575,5 @@ const styles = StyleSheet.create({
   h: { fontSize: 14, fontWeight: "800", marginTop: 20, marginBottom: 10 },
   grid: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   tile: { width: "31%", aspectRatio: 1, borderRadius: 12, borderWidth: 1, borderStyle: "dashed", alignItems: "center", justifyContent: "center", overflow: "hidden" },
+  banner: { flexDirection: "row", alignItems: "flex-start", gap: 8, padding: 12, borderRadius: 12, marginBottom: 16 },
 });

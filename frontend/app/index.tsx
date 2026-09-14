@@ -8,6 +8,7 @@ import { LinearGradient } from "expo-linear-gradient";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 
+import { useRouter } from "expo-router";
 import { useTheme, tokens } from "@/src/theme";
 import { useAuth } from "@/src/context/AuthContext";
 
@@ -17,6 +18,7 @@ type AuthMode = "intro" | "login" | "signup" | "phone";
 
 export default function Landing() {
   const c = useTheme();
+  const router = useRouter();
   const { login, register, loginWithGoogle, loginWithApple, requestPhoneOtp, verifyPhoneOtp } = useAuth();
   const [mode, setMode] = useState<AuthMode>("intro");
   const [email, setEmail] = useState("");
@@ -173,6 +175,19 @@ export default function Landing() {
                   {mode === "signup" && <Field c={c} label="Full name" value={name} onChangeText={setName} placeholder="Pratyush Sharma" icon="person" testID="name-input" />}
                   <Field c={c} label="Email" value={email} onChangeText={setEmail} placeholder="you@example.com" icon="mail" testID="email-input" keyboardType="email-address" autoCapitalize="none" />
                   <Field c={c} label="Password" value={password} onChangeText={setPassword} placeholder="Minimum 6 characters" icon="lock-closed" testID="password-input" secureTextEntry />
+                  {mode === "signup" && (
+                    <Text style={[styles.consentText, { color: c.onSurface3 }]}>
+                      By creating an account, you agree to our{" "}
+                      <Text testID="consent-terms-link" style={{ color: c.onSurface2, fontWeight: "800" }} onPress={() => router.push("/legal/terms" as any)}>
+                        Terms of Service
+                      </Text>{" "}
+                      and{" "}
+                      <Text testID="consent-privacy-link" style={{ color: c.onSurface2, fontWeight: "800" }} onPress={() => router.push("/legal/privacy" as any)}>
+                        Privacy Policy
+                      </Text>
+                      .
+                    </Text>
+                  )}
                   <Pressable testID="auth-submit-btn" disabled={busy} onPress={submit} style={({ pressed }) => [styles.primaryBtn, { backgroundColor: c.inverse, opacity: pressed || busy ? 0.85 : 1 }]}>
                     {busy ? <ActivityIndicator color={c.onInverse} /> : <Text style={{ color: c.onInverse, fontWeight: "900", fontSize: 16 }}>{mode === "login" ? "Sign in" : "Create account"}</Text>}
                   </Pressable>
@@ -294,6 +309,7 @@ const styles = StyleSheet.create({
   inputShell: { flexDirection: "row", alignItems: "center", gap: 10, borderWidth: 1, borderRadius: 16, paddingHorizontal: 14, minHeight: 54 },
   input: { flex: 1, fontSize: 16, paddingVertical: 13 },
   primaryBtn: { minHeight: 56, borderRadius: 17, alignItems: "center", justifyContent: "center", marginTop: 4 },
+  consentText: { fontSize: 12, lineHeight: 17, marginTop: 2, marginBottom: 10 },
   resendBtn: { alignItems: "center", paddingVertical: 14 },
   message: { marginTop: 13, fontWeight: "800", lineHeight: 20 },
   dividerRow: { flexDirection: "row", alignItems: "center", gap: 10, marginVertical: 20 },

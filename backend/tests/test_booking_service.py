@@ -2,6 +2,7 @@ from types import SimpleNamespace
 import asyncio
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -14,8 +15,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import server
 from features.booking import BookingService
-from test_critical_paths import booking_doc
+from test_critical_paths import FUTURE, booking_doc
 from test_quality_flows import USER, fake_db, vehicle
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
 
 
 def service(db):
@@ -26,8 +31,8 @@ def booking_payload(**overrides):
     data = {
         "vehicle_id": "veh_1",
         "plan": "daily",
-        "start_date": "2026-07-01T00:00:00+00:00",
-        "end_date": "2026-07-02T00:00:00+00:00",
+        "start_date": _iso(FUTURE),
+        "end_date": _iso(FUTURE + timedelta(days=1)),
         "add_ons": [],
     }
     data.update(overrides)
@@ -54,7 +59,7 @@ async def test_booking_service_create_rejects_invalid_ranges_and_conflicts(fake_
     assert bad_format.value.status_code == 400
 
     with pytest.raises(HTTPException) as reversed_range:
-        await service(fake_db).create_booking(booking_payload(end_date="2026-06-30T00:00:00+00:00"), USER)
+        await service(fake_db).create_booking(booking_payload(end_date=_iso(FUTURE - timedelta(days=1))), USER)
     assert reversed_range.value.status_code == 400
 
     fake_db.bookings.docs.append(booking_doc(status="active"))
@@ -88,8 +93,8 @@ async def test_booking_service_create_serializes_concurrent_overlapping_requests
             return ("error", exc.status_code)
 
     results = await asyncio.gather(
-        attempt("2026-07-01T00:00:00+00:00", "2026-07-03T00:00:00+00:00"),
-        attempt("2026-07-02T00:00:00+00:00", "2026-07-04T00:00:00+00:00"),
+        attempt(_iso(FUTURE), _iso(FUTURE + timedelta(days=2))),
+        attempt(_iso(FUTURE + timedelta(days=1)), _iso(FUTURE + timedelta(days=3))),
     )
 
     outcomes = [outcome for outcome, _ in results]
@@ -103,20 +108,43 @@ async def test_booking_service_create_serializes_concurrent_overlapping_requests
 
 
 @pytest.mark.asyncio
-async def test_booking_service_supports_hourly_weekly_and_monthly_pricing(fake_db):
+async def test_booking_service_prices_short_and_long_bookings_within_vehicle_range(fake_db):
+    """The pricing model is no longer "plan picks a flat rate table" - every
+    booking (regardless of the `plan` label, kept only for display) is priced
+    by PricingEngine from the vehicle's admin-configured min/max hourly rate
+    and how long/how far in advance the trip is. A short (near-minimum-
+    duration) booking should land near MAX_RATE; a long one should land at or
+    near MIN_RATE; the rate must never leave [min, max] either way."""
     fake_db.vehicles.docs.extend([
-        vehicle(vehicle_id="hourly", price_per_hour=50),
-        vehicle(vehicle_id="weekly", price_per_week=7000),
-        vehicle(vehicle_id="monthly", price_per_month=25000),
+        vehicle(vehicle_id="short", min_hourly_rate=80.0, max_hourly_rate=110.0),
+        vehicle(vehicle_id="long", min_hourly_rate=80.0, max_hourly_rate=110.0),
     ])
 
-    hourly = await service(fake_db).create_booking(booking_payload(vehicle_id="hourly", plan="hourly", end_date="2026-07-01T03:00:00+00:00"), USER)
-    weekly = await service(fake_db).create_booking(booking_payload(vehicle_id="weekly", plan="weekly", end_date="2026-07-09T00:00:00+00:00"), USER)
-    monthly = await service(fake_db).create_booking(booking_payload(vehicle_id="monthly", plan="monthly", end_date="2026-08-10T00:00:00+00:00"), USER)
+    # Exactly the minimum bookable duration for a car (6h) AND short notice
+    # (just past the 2h minimum) - both factors should push toward MAX_RATE.
+    # `FUTURE` (30 days out) is deliberately NOT used here: at that much lead
+    # time the lead-time factor alone would push toward MIN_RATE regardless
+    # of how short the duration is, which is correct engine behavior but
+    # would confound this specific assertion.
+    short_start = datetime.now(timezone.utc) + timedelta(hours=3)
+    short = await service(fake_db).create_booking(
+        booking_payload(vehicle_id="short", plan="hourly", start_date=_iso(short_start), end_date=_iso(short_start + timedelta(hours=6))), USER,
+    )
+    # Well past the default long-duration AND long-lead-time thresholds -
+    # both factors should push toward MIN_RATE.
+    long = await service(fake_db).create_booking(
+        booking_payload(vehicle_id="long", plan="daily", end_date=_iso(FUTURE + timedelta(hours=72))), USER,
+    )
 
-    assert hourly["total_amount"] == 150
-    assert weekly["total_amount"] == 14000
-    assert monthly["total_amount"] == 50000
+    assert short["pricing_breakdown"]["calculated_hourly_rate"] == pytest.approx(110.0, abs=1.0)
+    assert short["total_amount"] == pytest.approx(short["pricing_breakdown"]["calculated_hourly_rate"] * 6, abs=1.0)
+
+    assert long["pricing_breakdown"]["calculated_hourly_rate"] == pytest.approx(80.0, abs=0.5)
+    assert long["total_amount"] == pytest.approx(80.0 * 72, abs=5.0)
+
+    for booking in (short, long):
+        rate = booking["pricing_breakdown"]["calculated_hourly_rate"]
+        assert 80.0 <= rate <= 110.0
 
 
 @pytest.mark.asyncio
@@ -152,9 +180,13 @@ async def test_booking_service_extend_rejects_missing_invalid_status_bad_date_an
         await service(fake_db).extend_booking("bkg_1", SimpleNamespace(end_date="bad"), USER)
     assert bad_date.value.status_code == 400
 
-    fake_db.bookings.docs.append(booking_doc(booking_id="bkg_2", start_date="2026-07-02T12:00:00+00:00", end_date="2026-07-04T00:00:00+00:00"))
+    fake_db.bookings.docs.append(booking_doc(
+        booking_id="bkg_2",
+        start_date=_iso(FUTURE + timedelta(days=2)),
+        end_date=_iso(FUTURE + timedelta(days=4)),
+    ))
     with pytest.raises(HTTPException) as conflict:
-        await service(fake_db).extend_booking("bkg_1", SimpleNamespace(end_date="2026-07-03T00:00:00+00:00"), USER)
+        await service(fake_db).extend_booking("bkg_1", SimpleNamespace(end_date=_iso(FUTURE + timedelta(days=3))), USER)
     assert conflict.value.status_code == 409
 
 

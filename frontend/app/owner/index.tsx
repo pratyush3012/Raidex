@@ -3,14 +3,13 @@ import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, Alert
 import { Image } from "expo-image";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { useRouter } from "expo-router";
+import { useFocusEffect, useRouter } from "expo-router";
 import Animated, { useSharedValue, useAnimatedStyle, withTiming, withDelay, Easing } from "react-native-reanimated";
 import { useTheme, tokens } from "@/src/theme";
 import { api } from "@/src/api/client";
 import {
   RaidexButton,
   RaidexCard,
-  RaidexInput,
   RaidexChip,
   RaidexStatusPill,
   RaidexMetricCard,
@@ -34,6 +33,8 @@ export default function OwnerDashboard() {
   const [vehicles, setVehicles] = useState<any[]>([]);
   const [bookings, setBookings] = useState<any[]>([]);
   const [payouts, setPayouts] = useState<any[]>([]);
+  const [extensionEarnings, setExtensionEarnings] = useState<any>(null);
+  const [lateFeeEarnings, setLateFeeEarnings] = useState<any>(null);
   const [milestoneThresholds, setMilestoneThresholds] = useState<number[]>([]);
   const [serviceBenefits, setServiceBenefits] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
@@ -51,19 +52,26 @@ export default function OwnerDashboard() {
       setVehicles(await api<any[]>("/owner/vehicles"));
       setBookings(await api<any[]>("/owner/bookings"));
       setPayouts(await api<any[]>("/owner/payouts"));
-      const [milestoneCfg, benefits] = await Promise.all([
+      const [milestoneCfg, benefits, extEarnings, lateEarnings] = await Promise.all([
         api<{ thresholds_km: number[] }>("/service-milestones/config").catch(() => ({ thresholds_km: [] })),
         api<any[]>("/owner/service-benefits").catch(() => []),
+        api<any>("/owner/extension-earnings").catch(() => null),
+        api<any>("/owner/late-fee-earnings").catch(() => null),
       ]);
       setMilestoneThresholds(milestoneCfg.thresholds_km || []);
       setServiceBenefits(benefits);
+      setExtensionEarnings(extEarnings);
+      setLateFeeEarnings(lateEarnings);
       setOnboarded(true);
     } catch (err: any) {
       if (err.message?.includes("owner role required")) setOnboarded(false);
     } finally { setLoading(false); }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  // useFocusEffect (not a plain useEffect) so returning from the add-vehicle
+  // wizard (a separate route now) refreshes vehicles/earnings the same way
+  // the old inline form's onCreated callback used to.
+  useFocusEffect(useCallback(() => { load(); }, [load]));
 
   if (!onboarded) {
     return (
@@ -153,6 +161,27 @@ export default function OwnerDashboard() {
               <RaidexMetricCard testID="kpi-upcoming" label="Upcoming" value={String(earnings.future_bookings)} numeric={earnings.future_bookings} icon="calendar" />
             </View>
 
+            {(extensionEarnings || lateFeeEarnings) && (
+              <View style={{ flexDirection: "row", gap: 10, marginTop: 10 }}>
+                <RaidexMetricCard
+                  testID="kpi-extension-earnings"
+                  label="Extension earnings"
+                  value={`₹${(extensionEarnings?.total_earned ?? 0).toLocaleString()}`}
+                  numeric={extensionEarnings?.total_earned ?? 0}
+                  prefix="₹"
+                  icon="time"
+                />
+                <RaidexMetricCard
+                  testID="kpi-late-fee-earnings"
+                  label="Late fee earnings"
+                  value={`₹${(lateFeeEarnings?.total_earned ?? 0).toLocaleString()}`}
+                  numeric={lateFeeEarnings?.total_earned ?? 0}
+                  prefix="₹"
+                  icon="alert-circle"
+                />
+              </View>
+            )}
+
             <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: 16, marginTop: 24, marginBottom: 12 }}>Booking breakdown</Text>
             {Object.entries(earnings.by_status || {}).map(([k, v]: any) => (
               <View key={k} style={[styles.row, { backgroundColor: c.surface2, borderColor: c.border, marginBottom: 8, justifyContent: "space-between" }]}>
@@ -172,6 +201,24 @@ export default function OwnerDashboard() {
             ) : (
               payouts.map((p, i) => <PayoutRow key={p.payout_id} p={p} index={i} />)
             )}
+
+            {extensionEarnings?.items?.length > 0 && (
+              <View>
+                <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: 16, marginTop: 24, marginBottom: 12 }}>Recent extension earnings</Text>
+                {extensionEarnings.items.slice(0, 5).map((item: any, i: number) => (
+                  <ExtensionRow key={item.extension_id} item={item} index={i} />
+                ))}
+              </View>
+            )}
+
+            {lateFeeEarnings?.items?.length > 0 && (
+              <View>
+                <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: 16, marginTop: 24, marginBottom: 12 }}>Recent late fee earnings</Text>
+                {lateFeeEarnings.items.slice(0, 5).map((item: any, i: number) => (
+                  <LateFeeRow key={item.late_fee_id} item={item} index={i} />
+                ))}
+              </View>
+            )}
           </View>
         )}
 
@@ -184,7 +231,7 @@ export default function OwnerDashboard() {
                 title="No vehicles yet"
                 subtitle="Add your first car or bike to start earning."
                 actionLabel="+ Add vehicle"
-                onAction={() => setTab("add")}
+                onAction={() => router.push("/owner/add-vehicle")}
               />
             ) : (
               vehicles.map((v, i) => (
@@ -241,7 +288,7 @@ export default function OwnerDashboard() {
           </View>
         )}
 
-        {tab === "add" && <AddVehicleForm onCreated={() => { setTab("listings"); load(); }} />}
+        {tab === "add" && <AddVehicleCta onStart={() => router.push("/owner/add-vehicle")} />}
       </ScrollView>
     </View>
   );
@@ -298,6 +345,53 @@ function PayoutRow({ p, index }: { p: any; index: number }) {
           <RaidexStatusPill status={p.status} />
         </View>
         <PayoutStatusTrack status={p.status} />
+      </RaidexCard>
+    </Reveal>
+  );
+}
+
+// A single paid booking-extension payout (see BookingService.extend_booking /
+// GET /owner/extension-earnings) - same flat-card row shape as PayoutRow so
+// the earnings tab's list rows stay visually consistent everywhere.
+function ExtensionRow({ item, index }: { item: any; index: number }) {
+  const c = useTheme();
+  return (
+    <Reveal index={index}>
+      <RaidexCard variant="flat" style={{ marginBottom: tokens.spacing.sm }} testID={`extension-row-${item.extension_id}`}>
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <View style={{ flex: 1, marginRight: 8 }}>
+            <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: tokens.type.lg }}>₹{item.host_extension_payout.toLocaleString()} earned</Text>
+            <Text style={{ color: c.onSurface3, fontSize: 11, marginTop: 2 }}>
+              Booking {item.booking_id} · {item.extension_hours}h extension · {new Date(item.created_at).toLocaleDateString()}
+            </Text>
+          </View>
+          <RaidexStatusPill status="paid" />
+        </View>
+      </RaidexCard>
+    </Reveal>
+  );
+}
+
+// A single late-return fee share (see server.end_trip / GET
+// /owner/late-fee-earnings). payment_status reflects whether the fee was
+// actually collected from the customer's wallet ("paid") or is still
+// outstanding ("due") - never shown as earned unless it truly was.
+function LateFeeRow({ item, index }: { item: any; index: number }) {
+  const c = useTheme();
+  return (
+    <Reveal index={index}>
+      <RaidexCard variant="flat" style={{ marginBottom: tokens.spacing.sm }} testID={`late-fee-row-${item.late_fee_id}`}>
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <View style={{ flex: 1, marginRight: 8 }}>
+            <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: tokens.type.lg }}>
+              ₹{item.host_share.toLocaleString()} {item.payment_status === "paid" ? "earned" : "due"}
+            </Text>
+            <Text style={{ color: c.onSurface3, fontSize: 11, marginTop: 2 }}>
+              Booking {item.booking_id} · {item.billable_hours}h late · {new Date(item.created_at).toLocaleDateString()}
+            </Text>
+          </View>
+          <RaidexStatusPill status={item.payment_status} />
+        </View>
       </RaidexCard>
     </Reveal>
   );
@@ -375,64 +469,27 @@ function ServiceMilestoneProgress({ lifetimeKm, thresholds, benefits }: { lifeti
   );
 }
 
-function AddVehicleForm({ onCreated }: { onCreated: () => void }) {
+// The "Add vehicle" tab now only launches the staged wizard at
+// app/owner/add-vehicle.tsx - the actual form + POST /owner/vehicles submit
+// logic lives there exclusively so there's a single implementation of it,
+// not two parallel copies.
+function AddVehicleCta({ onStart }: { onStart: () => void }) {
   const c = useTheme();
-  const [form, setForm] = useState({
-    type: "car", name: "", brand: "", model: "",
-    image: "https://images.unsplash.com/photo-1758217209786-95458c5d30a7?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjY2NjV8MHwxfHNlYXJjaHwzfHxsdXh1cnklMjBTVVYlMjBkcml2aW5nfGVufDB8fHx8MTc4MTk3MTYwMnww&ixlib=rb-4.1.0&q=85",
-    price_per_hour: "200", price_per_day: "2000", price_per_week: "12000", price_per_month: "40000",
-    deposit: "5000", transmission: "Auto", fuel_type: "Petrol", seats: "5",
-    location: "Mumbai", description: "Well maintained and ready for your next trip.",
-  });
-  const [busy, setBusy] = useState(false);
-  const submit = async () => {
-    if (!form.name || !form.brand) { Alert.alert("Missing", "Enter name and brand."); return; }
-    setBusy(true);
-    try {
-      await api("/owner/vehicles", {
-        method: "POST",
-        body: {
-          ...form,
-          price_per_hour: parseFloat(form.price_per_hour), price_per_day: parseFloat(form.price_per_day),
-          price_per_week: parseFloat(form.price_per_week), price_per_month: parseFloat(form.price_per_month),
-          deposit: parseFloat(form.deposit), seats: parseInt(form.seats),
-          features: ["AC", "Music System"],
-        },
-      });
-      Alert.alert("Submitted", "Your listing is pending Raidex admin approval.");
-      onCreated();
-    } catch (e: any) { Alert.alert("Error", e.message); } finally { setBusy(false); }
-  };
   return (
     <View>
-      <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: 16, marginBottom: 12 }}>New vehicle</Text>
-      <Text style={{ color: c.onSurface2, fontSize: tokens.type.sm, fontWeight: tokens.weight.bold, marginBottom: 7 }}>Type</Text>
-      <View style={{ flexDirection: "row", gap: 8, marginBottom: tokens.spacing.md }}>
-        {["car", "bike"].map((t) => (
-          <RaidexChip key={t} testID={`type-${t}`} label={t.charAt(0).toUpperCase() + t.slice(1)} active={form.type === t} onPress={() => setForm({ ...form, type: t })} />
-        ))}
+      <RaidexCard variant="dark" padding={tokens.spacing.xl} testID="add-vehicle-cta">
+        <Ionicons name="add-circle" size={40} color="#22D98B" />
+        <Text style={{ color: "#fff", fontSize: tokens.type.xxl, fontWeight: tokens.weight.black, marginTop: 14 }}>List a new vehicle</Text>
+        <Text style={{ color: "rgba(255,255,255,0.7)", marginTop: 8 }}>
+          A short guided flow — type, specs, photos, pricing, deposit, pickup location and rules — ending with a preview before it's submitted for approval.
+        </Text>
+      </RaidexCard>
+      <View style={{ marginTop: 20 }}>
+        <RaidexButton testID="start-add-vehicle-btn" label="List a new vehicle" icon="arrow-forward" onPress={onStart} />
       </View>
-      {[
-        ["name", "Vehicle name", "Hyundai Creta Premium"],
-        ["brand", "Brand", "Hyundai"],
-        ["model", "Model", "Creta SX"],
-        ["price_per_day", "Price per day (₹)", "2000"],
-        ["price_per_month", "Price per month (₹)", "40000"],
-        ["deposit", "Deposit (₹)", "5000"],
-        ["seats", "Seats", "5"],
-        ["location", "City / Location", "Mumbai"],
-      ].map(([k, lbl, ph]) => (
-        <RaidexInput
-          key={k}
-          testID={`form-${k}`}
-          label={lbl}
-          value={(form as any)[k]}
-          onChangeText={(t) => setForm({ ...form, [k]: t })}
-          placeholder={ph as string}
-          keyboardType={k.startsWith("price") || k === "deposit" || k === "seats" ? "numeric" : "default"}
-        />
-      ))}
-      <RaidexButton testID="create-vehicle-btn" label="Submit for review" onPress={submit} loading={busy} disabled={busy} style={{ marginTop: 4 }} />
+      <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 12, textAlign: "center" }}>
+        New listings are reviewed by the Raidex team before they go live.
+      </Text>
     </View>
   );
 }

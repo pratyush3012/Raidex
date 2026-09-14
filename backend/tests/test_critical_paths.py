@@ -12,6 +12,10 @@ from test_quality_flows import DB, USER, Gateway, fake_db, vehicle
 
 ADMIN = {**USER, "user_id": "admin_1", "email": "admin@example.com", "role": "admin"}
 
+# Kept comfortably in the future (see BookingService.MIN_BOOKING_LEAD_HOURS)
+# rather than a hardcoded calendar date, so this fixture never time-bombs.
+FUTURE = datetime.now(timezone.utc) + timedelta(days=30)
+
 
 def booking_doc(**overrides):
     doc = {
@@ -21,8 +25,8 @@ def booking_doc(**overrides):
         "owner_id": "owner_1",
         "vehicle_snapshot": {"name": "Nexon EV", "image": "https://img", "type": "car", "brand": "Tata", "location": "Delhi"},
         "plan": "daily",
-        "start_date": "2026-07-01T00:00:00+00:00",
-        "end_date": "2026-07-02T00:00:00+00:00",
+        "start_date": FUTURE.isoformat(),
+        "end_date": (FUTURE + timedelta(days=1)).isoformat(),
         "total_amount": 1180,
         "deposit": 5000,
         "status": "confirmed",
@@ -150,18 +154,25 @@ async def test_booking_create_extension_cancellation_invoice_and_dispute_edges(f
     fake_db.vehicles.docs.append(vehicle(price_per_day=1200))
     created = await server.create_booking(server.BookingCreate(
         vehicle_id="veh_1", plan="daily",
-        start_date="2026-07-01T00:00:00+00:00",
-        end_date="2026-07-02T00:00:00+00:00",
+        start_date=FUTURE.isoformat(),
+        end_date=(FUTURE + timedelta(days=1)).isoformat(),
     ), USER)
     assert created["status"] == "pending_payment"
 
     booking_id = created["booking_id"]
     fake_db.bookings.docs[0]["status"] = "confirmed"
-    extended = await server.extend_booking(booking_id, server.BookingExtendRequest(end_date="2026-07-03T00:00:00+00:00"), USER)
-    assert extended["extension_amount_due"] == 1200
+    # Extensions are now paid immediately from the customer's wallet (see
+    # BookingService.extend_booking) - give the test user enough balance to
+    # cover a full day's worth of extension at the vehicle's MAX_RATE.
+    fake_db.users.docs[0]["wallet_balance"] = 10000
+    extended = await server.extend_booking(booking_id, server.BookingExtendRequest(end_date=(FUTURE + timedelta(days=2)).isoformat()), USER)
+    assert extended["extension"]["extension_hours"] == pytest.approx(24.0)
+    assert extended["extension"]["extension_amount"] > 0
+    assert extended["extension"]["host_extension_payout"] > 0
+    assert extended["end_date"] == (FUTURE + timedelta(days=2)).isoformat()
 
     with pytest.raises(HTTPException) as bad_extend:
-        await server.extend_booking(booking_id, server.BookingExtendRequest(end_date="2026-07-01T00:00:00+00:00"), USER)
+        await server.extend_booking(booking_id, server.BookingExtendRequest(end_date=FUTURE.isoformat()), USER)
     assert bad_extend.value.status_code == 400
 
     invoice = await server.booking_invoice(booking_id, gst=False, user=USER)

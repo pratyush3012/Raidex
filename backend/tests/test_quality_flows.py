@@ -17,6 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import server
 
+# Kept comfortably in the future (see BookingService.MIN_BOOKING_LEAD_HOURS)
+# rather than a hardcoded calendar date, so this suite never time-bombs.
+FUTURE = datetime.now(timezone.utc) + timedelta(days=30)
+
 
 USER = {
     "user_id": "usr_1",
@@ -74,6 +78,11 @@ class Collection:
         await asyncio.sleep(0)
         self.inserted.append(doc)
         self.docs.append(doc)
+
+    async def insert_many(self, docs, session=None):
+        await asyncio.sleep(0)
+        self.inserted.extend(docs)
+        self.docs.extend(docs)
 
     async def update_one(self, query, update, upsert=False, session=None):
         await asyncio.sleep(0)
@@ -212,6 +221,11 @@ class DB:
         self.analytics_snapshots = Collection()
         self.phone_otp_challenges = Collection()
         self.push_tokens = Collection()
+        self.pricing_config = Collection()
+        self.booking_extensions = Collection()
+        self.financial_ledger = Collection()
+        self.late_fees = Collection()
+        self.early_checkins = Collection()
 
     async def command(self, *_args, **_kwargs):
         return {"ok": 1}
@@ -275,8 +289,8 @@ async def test_booking_requires_verified_kyc(fake_db):
     payload = server.BookingCreate(
         vehicle_id="veh_1",
         plan="daily",
-        start_date="2026-07-01T00:00:00+00:00",
-        end_date="2026-07-02T00:00:00+00:00",
+        start_date=FUTURE.isoformat(),
+        end_date=(FUTURE + timedelta(days=1)).isoformat(),
     )
     with pytest.raises(HTTPException) as exc:
         await server.create_booking(payload, {**USER, "kyc_status": "pending"})
@@ -290,14 +304,14 @@ async def test_booking_conflict_blocks_double_booking(fake_db):
         "booking_id": "bkg_existing",
         "vehicle_id": "veh_1",
         "status": "confirmed",
-        "start_date": "2026-07-01T00:00:00+00:00",
-        "end_date": "2026-07-03T00:00:00+00:00",
+        "start_date": FUTURE.isoformat(),
+        "end_date": (FUTURE + timedelta(days=2)).isoformat(),
     })
     payload = server.BookingCreate(
         vehicle_id="veh_1",
         plan="daily",
-        start_date="2026-07-02T00:00:00+00:00",
-        end_date="2026-07-04T00:00:00+00:00",
+        start_date=(FUTURE + timedelta(days=1)).isoformat(),
+        end_date=(FUTURE + timedelta(days=3)).isoformat(),
     )
     with pytest.raises(HTTPException) as exc:
         await server.create_booking(payload, USER)
@@ -333,6 +347,85 @@ async def test_dispute_rejects_booking_id_mismatch(fake_db):
 async def test_coupon_validation_caps_percent_discount(fake_db):
     result = await server.validate_coupon(server.CouponValidateRequest(code="RAIDEX10", amount=8000), USER)
     assert result == {"code": "RAIDEX10", "valid": True, "discount": 500, "payable": 7500}
+
+
+ADMIN = {"user_id": "usr_admin", "email": "admin@raidex.io", "name": "Admin", "role": "admin", "roles": ["admin"]}
+
+
+@pytest.mark.asyncio
+async def test_admin_create_coupon_persists_real_document(fake_db):
+    payload = server.CouponCreate(code="save20", type="percent", value=20, max_discount=300, description="20% off, up to Rs 300")
+    created = await server.admin_create_coupon(payload, ADMIN)
+    assert created["code"] == "SAVE20"
+    assert fake_db.coupons.docs[0]["code"] == "SAVE20"
+    assert fake_db.admin_audit.docs[-1]["action"] == "coupon.create"
+    # And it now validates for real through the untouched /coupons/validate route.
+    result = await server.validate_coupon(server.CouponValidateRequest(code="SAVE20", amount=1000), USER)
+    assert result == {"code": "SAVE20", "valid": True, "discount": 200, "payable": 800}
+
+
+@pytest.mark.asyncio
+async def test_admin_create_coupon_rejects_duplicate_code_with_409(fake_db):
+    payload = server.CouponCreate(code="DUPE10", type="flat", value=50, description="flat 50")
+    await server.admin_create_coupon(payload, ADMIN)
+    with pytest.raises(HTTPException) as exc:
+        await server.admin_create_coupon(payload, ADMIN)
+    assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_admin_create_coupon_requires_admin_role(fake_db):
+    payload = server.CouponCreate(code="NOPE10", type="flat", value=10, description="x")
+    with pytest.raises(HTTPException) as exc:
+        await server.admin_create_coupon(payload, USER)
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_list_coupons_returns_active_and_inactive(fake_db):
+    await server.admin_create_coupon(server.CouponCreate(code="ACTIVE1", type="flat", value=10, description="x", active=True), ADMIN)
+    await server.admin_create_coupon(server.CouponCreate(code="INACTIVE1", type="flat", value=10, description="x", active=False), ADMIN)
+    items = await server.admin_list_coupons(ADMIN)
+    codes = {item["code"] for item in items}
+    assert codes == {"ACTIVE1", "INACTIVE1"}
+
+
+@pytest.mark.asyncio
+async def test_admin_update_coupon_toggles_active(fake_db):
+    await server.admin_create_coupon(server.CouponCreate(code="TOGGLE1", type="flat", value=10, description="x"), ADMIN)
+    updated = await server.admin_update_coupon("toggle1", server.CouponUpdate(active=False), ADMIN)
+    assert updated["active"] is False
+    assert fake_db.admin_audit.docs[-1]["action"] == "coupon.update"
+    # Deactivated coupons stop validating.
+    with pytest.raises(HTTPException) as exc:
+        await server.validate_coupon(server.CouponValidateRequest(code="TOGGLE1", amount=500), USER)
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_admin_update_coupon_missing_code_returns_404(fake_db):
+    with pytest.raises(HTTPException) as exc:
+        await server.admin_update_coupon("GHOST1", server.CouponUpdate(active=False), ADMIN)
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_customer_coupon_list_excludes_inactive_and_expired(fake_db):
+    await server.admin_create_coupon(server.CouponCreate(code="VISIBLE1", type="percent", value=10, max_discount=200, description="10% off", active=True), ADMIN)
+    await server.admin_create_coupon(server.CouponCreate(code="HIDDEN1", type="flat", value=50, description="hidden", active=False), ADMIN)
+    past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    await server.admin_create_coupon(server.CouponCreate(code="EXPIRED1", type="flat", value=50, description="expired", active=True, expires_at=past), ADMIN)
+    future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    await server.admin_create_coupon(server.CouponCreate(code="FUTURE1", type="flat", value=50, description="not expired yet", active=True, expires_at=future), ADMIN)
+
+    listed = await server.list_coupons(USER)
+    codes = {item["code"] for item in listed}
+    assert codes == {"VISIBLE1", "FUTURE1"}
+    visible = next(item for item in listed if item["code"] == "VISIBLE1")
+    assert visible == {
+        "code": "VISIBLE1", "description": "10% off", "type": "percent",
+        "value": 10, "max_discount": 200, "min_amount": None, "expires_at": None,
+    }
 
 
 @pytest.mark.asyncio

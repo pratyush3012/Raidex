@@ -5,9 +5,15 @@ import { useTheme, tokens } from "@/src/theme";
 // One centralized status → color mapping used everywhere a status badge
 // appears (payouts, KYC, disputes, swaps, subscriptions, geofence events)
 // instead of every screen inventing its own color ternary.
-const STATUS_TONE: Record<string, "positive" | "warning" | "negative" | "neutral"> = {
-  paid: "positive", completed: "positive", confirmed: "positive", approved: "positive",
-  verified: "positive", active: "positive", eligible: "warning", fulfilled: "positive",
+// "active" gets its own "info" tone (distinct from "positive") so a
+// live-right-now trip/subscription reads differently from a merely confirmed
+// (not yet started) one; "completed" is "neutral" rather than "positive" -
+// green should mean "good and current," not "over and done."
+const STATUS_TONE: Record<string, "positive" | "info" | "warning" | "negative" | "neutral"> = {
+  paid: "positive", confirmed: "positive", approved: "positive",
+  verified: "positive", eligible: "warning", fulfilled: "positive",
+  active: "info",
+  completed: "neutral",
   pending: "warning", processing: "warning", requested: "warning", submitted: "warning",
   pending_payment: "warning", pending_partner_fulfillment: "warning",
   failed: "negative", rejected: "negative", cancelled: "negative", disputed: "negative", expired: "negative",
@@ -18,6 +24,7 @@ export function RaidexStatusPill({ status, label }: { status: string; label?: st
   const tone = STATUS_TONE[status.toLowerCase()] ?? "neutral";
   const colors = {
     positive: { bg: c.accentBg, fg: c.onAccentBg },
+    info: { bg: c.infoBg, fg: c.onInfoBg },
     warning: { bg: c.warning + "26", fg: c.warning },
     negative: { bg: c.error + "22", fg: c.error },
     neutral: { bg: c.surface3, fg: c.onSurface2 },

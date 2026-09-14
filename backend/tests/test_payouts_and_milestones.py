@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -159,9 +160,14 @@ async def test_milestone_thresholds_are_configurable(fake_db):
 @pytest.mark.asyncio
 async def test_end_trip_creates_payout_and_returns_it(fake_db, monkeypatch):
     fake_db.vehicles.docs.append(vehicle(vehicle_id="veh_1", owner_id=OWNER_ID, price_per_day=1000))
+    now = datetime.now(timezone.utc)
     fake_db.bookings.docs.append({
         "booking_id": "bkg_1", "user_id": USER["user_id"], "vehicle_id": "veh_1", "owner_id": OWNER_ID,
         "status": "active", "odometer_start": 100, "total_amount": 1000.0,
+        # Scheduled return is still in the future relative to "now" so
+        # end_trip's late-fee check (see server.py's end_trip) finds nothing
+        # billable - this test is about payout creation, not late fees.
+        "start_date": (now - timedelta(hours=22)).isoformat(), "end_date": (now + timedelta(hours=2)).isoformat(),
         "commission_rate": 0.40, "commission_amount": 400.0, "owner_net_amount": 600.0,
     })
     fake_db.inspections.docs.append({

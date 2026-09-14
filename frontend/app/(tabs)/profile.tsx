@@ -121,6 +121,10 @@ export default function ProfileScreen() {
         <View style={[styles.menu, { backgroundColor: c.surface2, borderColor: c.border }]}>
           <MenuRow c={c} icon="shield-checkmark" label={user?.kyc_status === "verified" ? "KYC Verified" : "Complete KYC"} onPress={doKyc} testID="kyc-row" />
           <Divider c={c} />
+          <MenuRow c={c} icon="heart" label="Favorites" onPress={() => router.push("/favorites" as any)} testID="favorites-row" />
+          <Divider c={c} />
+          <MenuRow c={c} icon="wallet" label="Wallet" onPress={() => router.push("/wallet" as any)} testID="wallet-row" />
+          <Divider c={c} />
           <MenuRow c={c} icon="card" label="Payment methods" onPress={() => showComingSoon("Payment methods", "Cards, UPI, wallet, and net banking are available during checkout.")} testID="payment-methods-row" />
           <Divider c={c} />
           <MenuRow c={c} icon="receipt" label="Coupons" onPress={() => showComingSoon("Coupons", "No active coupons right now. RideMiles rewards are applied automatically after eligible trips.")} testID="coupons-row" />
@@ -128,6 +132,14 @@ export default function ProfileScreen() {
           <MenuRow c={c} icon="warning" label="Emergency SOS" onPress={callEmergency} testID="sos-row" />
           <Divider c={c} />
           <MenuRow c={c} icon="help-circle" label="Support" onPress={() => router.push("/support" as any)} testID="help-row" />
+        </View>
+
+        <View style={[styles.menu, { backgroundColor: c.surface2, borderColor: c.border, marginTop: tokens.spacing.lg }]}>
+          <MenuRow c={c} icon="document-text" label="Terms of Service" onPress={() => router.push("/legal/terms" as any)} testID="terms-row" />
+          <Divider c={c} />
+          <MenuRow c={c} icon="lock-closed" label="Privacy Policy" onPress={() => router.push("/legal/privacy" as any)} testID="privacy-row" />
+          <Divider c={c} />
+          <MenuRow c={c} icon="cash" label="Refund Policy" onPress={() => router.push("/legal/refund-policy" as any)} testID="refund-policy-row" />
         </View>
 
         <View style={[styles.menu, { backgroundColor: c.surface2, borderColor: c.border, marginTop: tokens.spacing.lg }]}>

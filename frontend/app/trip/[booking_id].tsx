@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { View, Text, StyleSheet, Pressable, ActivityIndicator, Dimensions, Platform } from "react-native";
+import { View, Text, StyleSheet, Pressable, ActivityIndicator, Dimensions, Platform, Linking, Share, Alert, ScrollView } from "react-native";
 import Svg, { Circle, Path, Defs, LinearGradient as SvgGradient, Stop, Line } from "react-native-svg";
 import Animated, {
   useSharedValue,
@@ -14,11 +14,30 @@ import { Ionicons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as Location from "expo-location";
+import { format } from "date-fns";
 import { useTheme, tokens } from "@/src/theme";
 import { api } from "@/src/api/client";
+import { RaidexErrorState, RaidexModal, RaidexChip, RaidexInput, RaidexButton, RaidexBadge } from "@/src/components/ui";
 
 const { width } = Dimensions.get("window");
 const MAP_H = 360;
+
+// Real, well-known Indian public emergency numbers — these dial the actual
+// public emergency services, never a fabricated "Raidex emergency" line.
+const EMERGENCY_NUMBERS = [
+  { label: "National emergency number", number: "112", icon: "alert-circle" as const },
+  { label: "Police", number: "100", icon: "shield" as const },
+  { label: "Ambulance", number: "108", icon: "medkit" as const },
+];
+
+const DISPUTE_CATEGORIES: { value: "payment" | "damage" | "refund" | "host" | "vehicle" | "other"; label: string }[] = [
+  { value: "vehicle", label: "Vehicle issue" },
+  { value: "damage", label: "Damage" },
+  { value: "payment", label: "Payment" },
+  { value: "refund", label: "Refund" },
+  { value: "host", label: "Host" },
+  { value: "other", label: "Other" },
+];
 
 // Animated wrapper so the current-position marker can ease its cx/cy toward
 // each new GPS/simulated tick instead of snapping discretely between points.
@@ -37,6 +56,7 @@ export default function ActiveTrip() {
   const insets = useSafeAreaInsets();
   const [booking, setBooking] = useState<any>(null);
   const [vehicle, setVehicle] = useState<any>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [trail, setTrail] = useState<{ lat: number; lng: number }[]>([]);
   const [speed, setSpeed] = useState(0);
   const [gpsMode, setGpsMode] = useState<"real" | "simulated">("simulated");
@@ -46,21 +66,44 @@ export default function ActiveTrip() {
   // Re-render timer for elapsed display
   const [, setTimerTick] = useState(0);
 
+  // Trip support sheet + report-an-issue form state
+  const [supportOpen, setSupportOpen] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportCategory, setReportCategory] = useState<typeof DISPUTE_CATEGORIES[number]["value"]>("vehicle");
+  const [reportMessage, setReportMessage] = useState("");
+  const [reportSubmitting, setReportSubmitting] = useState(false);
+  const [reportError, setReportError] = useState<string | null>(null);
+
+  // Extend-trip sheet state. There is no extension-price-preview endpoint —
+  // the real numbers (MAX_RATE, tax, total) only come back from the actual
+  // POST /extend call, so this shows the exact charge only after that call
+  // succeeds (or fails), rather than fabricating a client-side estimate.
+  const [extendOpen, setExtendOpen] = useState(false);
+  const [extendStep, setExtendStep] = useState<"select" | "result">("select");
+  const [extendAddHours, setExtendAddHours] = useState(1);
+  const [extending, setExtending] = useState(false);
+  const [extendError, setExtendError] = useState<string | null>(null);
+  const [extendShowTopUp, setExtendShowTopUp] = useState(false);
+  const [extendResult, setExtendResult] = useState<any>(null);
+
   useEffect(() => {
     const id = setInterval(() => setTimerTick((t) => t + 1), 1000);
     return () => clearInterval(id);
   }, []);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const b = await api<any>(`/bookings/${booking_id}`);
-        setBooking(b);
-        const v = await api<any>(`/vehicles/${b.vehicle_id}`);
-        setVehicle(v);
-      } catch {}
-    })();
+  const loadTrip = React.useCallback(async () => {
+    setLoadError(null);
+    try {
+      const b = await api<any>(`/bookings/${booking_id}`);
+      setBooking(b);
+      const v = await api<any>(`/vehicles/${b.vehicle_id}`);
+      setVehicle(v);
+    } catch (e: any) {
+      setLoadError(e?.message || "Could not load this trip");
+    }
   }, [booking_id]);
+
+  useEffect(() => { loadTrip(); }, [loadTrip]);
 
   // GPS: try real expo-location first, fall back to route simulation
   useEffect(() => {
@@ -204,6 +247,14 @@ export default function ActiveTrip() {
     transform: [{ scale: 0.94 + statsEntrance.value * 0.06 }, { translateY: (1 - statsEntrance.value) * 14 }],
   }));
 
+  if (loadError) {
+    return (
+      <View style={{ flex: 1, backgroundColor: c.surface, justifyContent: "center" }}>
+        <RaidexErrorState message={loadError} onRetry={loadTrip} testID="active-trip-error-state" />
+      </View>
+    );
+  }
+
   if (!booking || !vehicle) {
     return (
       <View style={{ flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: c.surface }}>
@@ -218,6 +269,104 @@ export default function ActiveTrip() {
   const km = gpsMode === "real"
     ? (tick * 0.08).toFixed(1)   // rough km from track count at real GPS
     : (tick * 1.2).toFixed(1);   // simulated
+
+  const lastPoint = trail[trail.length - 1] || null;
+  const canShareLocation = gpsMode === "real" && !!lastPoint;
+
+  // Scheduled-end countdown / overdue state — reuses the same 1s timer
+  // ("Trip started" elapsed clock above) rather than a second interval.
+  const scheduledEnd = booking?.end_date ? new Date(booking.end_date) : null;
+  const remainingMs = scheduledEnd ? scheduledEnd.getTime() - Date.now() : 0;
+  const isOverdue = scheduledEnd ? remainingMs < 0 : false;
+  const absMs = Math.abs(remainingMs);
+  const remHrs = Math.floor(absMs / 3_600_000);
+  const remMins = Math.floor((absMs % 3_600_000) / 60_000);
+  const remainingLabel = `${remHrs}h ${remMins}m`;
+
+  const currentEndDate = scheduledEnd ?? new Date();
+  const proposedNewEnd = new Date(currentEndDate.getTime() + extendAddHours * 3_600_000);
+
+  const resetExtendSheet = () => {
+    setExtendOpen(false);
+    setExtendStep("select");
+    setExtendAddHours(1);
+    setExtendError(null);
+    setExtendShowTopUp(false);
+    setExtendResult(null);
+    setExtending(false);
+  };
+
+  const doExtend = async () => {
+    setExtending(true);
+    setExtendError(null);
+    setExtendShowTopUp(false);
+    try {
+      const r = await api<any>(`/bookings/${booking_id}/extend`, {
+        method: "POST",
+        body: { end_date: proposedNewEnd.toISOString() },
+      });
+      setExtendResult(r.extension);
+      setExtendStep("result");
+      setBooking((prev: any) => (prev ? { ...prev, end_date: r.end_date } : prev));
+    } catch (e: any) {
+      setExtendError(e?.message || "Could not extend this trip. Please try again.");
+      setExtendShowTopUp(e?.status === 402);
+    } finally {
+      setExtending(false);
+    }
+  };
+
+  const openSupportChat = () => {
+    setSupportOpen(false);
+    router.push(`/support?booking_id=${booking_id}` as any);
+  };
+
+  const openReportForm = () => {
+    setSupportOpen(false);
+    setReportError(null);
+    setReportOpen(true);
+  };
+
+  const callEmergencyNumber = (number: string) => {
+    Linking.openURL(`tel:${number}`).catch(() => {
+      Alert.alert("Could not place call", "Your device could not open the dialer for this number.");
+    });
+  };
+
+  const shareCurrentLocation = async () => {
+    if (!lastPoint) return;
+    const mapsUrl = `https://www.google.com/maps?q=${lastPoint.lat},${lastPoint.lng}`;
+    try {
+      await Share.share({
+        message: `I'm sharing my live location from my Raidex trip: ${mapsUrl}`,
+        url: mapsUrl,
+      });
+    } catch {}
+  };
+
+  const submitReport = async () => {
+    const trimmed = reportMessage.trim();
+    if (trimmed.length < 10) {
+      setReportError("Please describe the issue in at least 10 characters.");
+      return;
+    }
+    setReportError(null);
+    setReportSubmitting(true);
+    try {
+      await api(`/bookings/${booking_id}/disputes`, {
+        method: "POST",
+        body: { booking_id, category: reportCategory, message: trimmed },
+      });
+      setReportOpen(false);
+      setReportMessage("");
+      setReportCategory("vehicle");
+      Alert.alert("Report submitted", "Thanks — our team will review this and follow up.");
+    } catch (e: any) {
+      setReportError(e?.message || "Could not submit your report. Please try again.");
+    } finally {
+      setReportSubmitting(false);
+    }
+  };
 
   return (
     <View style={{ flex: 1, backgroundColor: c.surface }}>
@@ -289,6 +438,51 @@ export default function ActiveTrip() {
           )}
         </View>
 
+        {scheduledEnd && (
+          <View style={[styles.row, { backgroundColor: isOverdue ? "rgba(239,68,68,0.08)" : c.surface2, borderColor: isOverdue ? c.error : c.border, marginTop: 10 }]}>
+            <Ionicons name={isOverdue ? "alert-circle" : "time-outline"} size={20} color={isOverdue ? c.error : c.onSurface} />
+            <View style={{ flex: 1 }}>
+              <Text style={{ color: isOverdue ? c.error : c.onSurface, fontWeight: "700", fontSize: 13 }}>
+                {isOverdue ? `Overdue by ${remainingLabel}` : `Trip ends in ${remainingLabel}`}
+              </Text>
+              <Text style={{ color: c.onSurface3, fontSize: 11, marginTop: 2 }}>
+                Scheduled return: {format(scheduledEnd, "EEE, d MMM · h:mm a")}
+              </Text>
+            </View>
+            {isOverdue && <RaidexBadge label="LATE FEE MAY APPLY" tone="neutral" />}
+          </View>
+        )}
+
+        <Pressable
+          testID="trip-support-row"
+          onPress={() => setSupportOpen(true)}
+          style={[styles.row, { backgroundColor: c.surface2, borderColor: c.border, marginTop: 10 }]}
+        >
+          <Ionicons name="help-buoy" size={20} color={c.onSurface} />
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: c.onSurface, fontWeight: "700", fontSize: 13 }}>Trip support</Text>
+            <Text style={{ color: c.onSurface3, fontSize: 11, marginTop: 2 }}>
+              Contact support, report an issue, or emergency numbers
+            </Text>
+          </View>
+          <Ionicons name="chevron-forward" size={18} color={c.onSurface3} />
+        </Pressable>
+
+        <Pressable
+          testID="trip-extend-row"
+          onPress={() => { resetExtendSheet(); setExtendOpen(true); }}
+          style={[styles.row, { backgroundColor: c.surface2, borderColor: c.border, marginTop: 10 }]}
+        >
+          <Ionicons name="add-circle-outline" size={20} color={c.accent} />
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: c.onSurface, fontWeight: "700", fontSize: 13 }}>Extend trip</Text>
+            <Text style={{ color: c.onSurface3, fontSize: 11, marginTop: 2 }}>
+              Push back your return time — charged from your wallet
+            </Text>
+          </View>
+          <Ionicons name="chevron-forward" size={18} color={c.onSurface3} />
+        </Pressable>
+
         <View style={{ flex: 1 }} />
 
         <Pressable
@@ -300,7 +494,208 @@ export default function ActiveTrip() {
           <Text style={{ color: "#fff", fontWeight: "800", fontSize: 16 }}>End trip</Text>
         </Pressable>
       </View>
+
+      <RaidexModal
+        testID="trip-support-modal"
+        visible={supportOpen}
+        title="Trip support"
+        subtitle="Get help with your active trip."
+        onDismiss={() => setSupportOpen(false)}
+        dismissLabel="Close"
+      >
+        <ScrollView showsVerticalScrollIndicator={false} style={{ maxHeight: 420 }}>
+          <SupportRow icon="chatbubbles" title="Contact support" sub="Chat with Raidex support about this trip" onPress={openSupportChat} c={c} testID="support-contact-option" />
+          <SupportRow icon="alert-circle" title="Report an issue" sub="File a report about the vehicle, host, or trip" onPress={openReportForm} c={c} testID="support-report-option" />
+          <SupportRow
+            icon="location"
+            title="Share my current location"
+            sub={canShareLocation ? "Send your live GPS position via a maps link" : "Unavailable — GPS is in simulated mode"}
+            onPress={shareCurrentLocation}
+            c={c}
+            disabled={!canShareLocation}
+            testID="support-share-location-option"
+          />
+
+          <Text style={{ color: c.onSurface3, fontSize: 11, fontWeight: "800", letterSpacing: 1, marginTop: tokens.spacing.lg }}>
+            EMERGENCY NUMBERS
+          </Text>
+          <Text style={{ color: c.onSurface3, fontSize: 11, marginTop: 4, marginBottom: 8 }}>
+            These call public emergency services directly — not Raidex support.
+          </Text>
+          {EMERGENCY_NUMBERS.map((e) => (
+            <Pressable
+              key={e.number}
+              testID={`emergency-call-${e.number}`}
+              onPress={() => callEmergencyNumber(e.number)}
+              style={[styles.row, { backgroundColor: c.surface2, borderColor: c.border, marginTop: 8 }]}
+            >
+              <Ionicons name={e.icon} size={18} color={c.error} />
+              <View style={{ flex: 1 }}>
+                <Text style={{ color: c.onSurface, fontWeight: "700", fontSize: 13 }}>{e.label}</Text>
+              </View>
+              <Text style={{ color: c.error, fontWeight: "800", fontSize: 16 }}>{e.number}</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+      </RaidexModal>
+
+      <RaidexModal
+        testID="report-issue-modal"
+        visible={reportOpen}
+        title="Report an issue"
+        subtitle="Tell us what's wrong — our team will follow up."
+        onDismiss={() => { if (!reportSubmitting) setReportOpen(false); }}
+        primaryLabel="Submit report"
+        onPrimary={submitReport}
+        primaryBusy={reportSubmitting}
+        primaryDisabled={reportSubmitting || reportMessage.trim().length < 10}
+        primaryTestID="submit-report-btn"
+        dismissLabel="Cancel"
+      >
+        <Text style={{ color: c.onSurface2, fontSize: 12, fontWeight: "700", marginBottom: 8 }}>CATEGORY</Text>
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: tokens.spacing.md }}>
+          {DISPUTE_CATEGORIES.map((cat) => (
+            <RaidexChip
+              key={cat.value}
+              testID={`report-category-${cat.value}`}
+              label={cat.label}
+              active={reportCategory === cat.value}
+              onPress={() => setReportCategory(cat.value)}
+            />
+          ))}
+        </View>
+        <RaidexInput
+          testID="report-message-input"
+          label="Description"
+          value={reportMessage}
+          onChangeText={setReportMessage}
+          placeholder="Describe the issue in at least 10 characters…"
+          multiline
+          numberOfLines={4}
+          maxLength={1500}
+          textAlignVertical="top"
+          error={reportError ?? undefined}
+        />
+      </RaidexModal>
+
+      <RaidexModal
+        testID="extend-trip-modal"
+        visible={extendOpen}
+        title={extendStep === "result" ? "Extension confirmed" : "Extend trip"}
+        subtitle={
+          extendStep === "result"
+            ? undefined
+            : "Extensions are charged at the vehicle's maximum hourly rate and paid immediately from your wallet balance."
+        }
+        onDismiss={() => { if (!extending) resetExtendSheet(); }}
+        dismissLabel={extendStep === "result" ? "Done" : "Cancel"}
+        primaryLabel={extendStep === "select" ? "Confirm & pay" : undefined}
+        onPrimary={extendStep === "select" ? doExtend : undefined}
+        primaryBusy={extending}
+        primaryDisabled={extending}
+        primaryTestID="extend-confirm-btn"
+        dismissTestID={extendStep === "result" ? "extend-done-btn" : "extend-cancel-btn"}
+      >
+        {extendStep === "select" ? (
+          <View>
+            <Text style={{ color: c.onSurface3, fontSize: 12, fontWeight: "700", marginBottom: 8 }}>
+              CURRENT RETURN TIME
+            </Text>
+            <Text style={{ color: c.onSurface, fontSize: 15, fontWeight: "700", marginBottom: 16 }}>
+              {scheduledEnd ? format(scheduledEnd, "EEE, d MMM · h:mm a") : "—"}
+            </Text>
+
+            <Text style={{ color: c.onSurface3, fontSize: 12, fontWeight: "700", marginBottom: 8 }}>
+              ADD TIME
+            </Text>
+            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+              {[0.5, 1, 2, 3, 6].map((h) => (
+                <RaidexChip
+                  key={h}
+                  testID={`extend-add-${h}`}
+                  label={h < 1 ? "30 min" : `${h}h`}
+                  active={extendAddHours === h}
+                  onPress={() => setExtendAddHours(h)}
+                />
+              ))}
+            </View>
+
+            <View style={[styles.row, { backgroundColor: c.surface2, borderColor: c.border, marginTop: 0 }]}>
+              <Ionicons name="flag-outline" size={20} color={c.accent} />
+              <View style={{ flex: 1 }}>
+                <Text style={{ color: c.onSurface3, fontSize: 11 }}>New return time</Text>
+                <Text testID="extend-new-end-time" style={{ color: c.onSurface, fontWeight: "700", fontSize: 14, marginTop: 2 }}>
+                  {format(proposedNewEnd, "EEE, d MMM · h:mm a")}
+                </Text>
+              </View>
+            </View>
+
+            <Text style={{ color: c.onSurface3, fontSize: 11, marginTop: 14, lineHeight: 16 }}>
+              Confirm to see and pay the exact extension cost — the final rate, tax, and total are calculated by
+              Raidex and charged from your wallet the moment you confirm.
+            </Text>
+
+            {extendError && (
+              <View style={{ marginTop: 14 }}>
+                <Text style={{ color: c.error, fontSize: 12.5, fontWeight: "600" }}>{extendError}</Text>
+                {extendShowTopUp && (
+                  <View style={{ marginTop: 10 }}>
+                    <RaidexButton
+                      testID="extend-topup-wallet-btn"
+                      label="Top up wallet"
+                      icon="wallet-outline"
+                      iconPosition="leading"
+                      variant="secondary"
+                      onPress={() => { resetExtendSheet(); router.push("/wallet" as any); }}
+                    />
+                  </View>
+                )}
+              </View>
+            )}
+          </View>
+        ) : (
+          <View>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 16 }}>
+              <Ionicons name="checkmark-circle" size={20} color={c.accent} />
+              <Text style={{ color: c.onSurface, fontWeight: "700", fontSize: 13 }}>
+                Return time updated to {scheduledEnd ? format(scheduledEnd, "h:mm a") : ""}
+              </Text>
+            </View>
+            <ExtendRow label="Extension hourly rate" value={`₹${extendResult?.extension_hourly_rate?.toFixed?.(2) ?? extendResult?.extension_hourly_rate}`} c={c} />
+            <ExtendRow label="Extension hours" value={`${extendResult?.extension_hours}`} c={c} />
+            <ExtendRow label="Extension amount" value={`₹${extendResult?.extension_amount?.toFixed?.(2) ?? extendResult?.extension_amount}`} c={c} />
+            <ExtendRow label="Tax" value={`₹${extendResult?.tax?.toFixed?.(2) ?? extendResult?.tax}`} c={c} />
+            <ExtendRow label="Total charged" value={`₹${extendResult?.total_payable?.toFixed?.(2) ?? extendResult?.total_payable}`} c={c} bold />
+          </View>
+        )}
+      </RaidexModal>
     </View>
+  );
+}
+
+function ExtendRow({ label, value, c, bold }: { label: string; value: string; c: any; bold?: boolean }) {
+  return (
+    <View style={{ flexDirection: "row", justifyContent: "space-between", paddingVertical: 8, borderTopWidth: 1, borderTopColor: c.border }}>
+      <Text style={{ color: c.onSurface3, fontSize: 13 }}>{label}</Text>
+      <Text testID={`extend-result-${label.toLowerCase().replace(/\s+/g, "-")}`} style={{ color: c.onSurface, fontSize: 13, fontWeight: bold ? "800" : "600" }}>{value}</Text>
+    </View>
+  );
+}
+
+function SupportRow({ icon, title, sub, onPress, c, disabled, testID }: any) {
+  return (
+    <Pressable
+      testID={testID}
+      onPress={disabled ? undefined : onPress}
+      style={[styles.row, { backgroundColor: c.surface2, borderColor: c.border, marginTop: 10, opacity: disabled ? 0.5 : 1 }]}
+    >
+      <Ionicons name={icon} size={20} color={c.onSurface} />
+      <View style={{ flex: 1 }}>
+        <Text style={{ color: c.onSurface, fontWeight: "700", fontSize: 13 }}>{title}</Text>
+        <Text style={{ color: c.onSurface3, fontSize: 11, marginTop: 2 }}>{sub}</Text>
+      </View>
+      {!disabled && <Ionicons name="chevron-forward" size={18} color={c.onSurface3} />}
+    </Pressable>
   );
 }
 

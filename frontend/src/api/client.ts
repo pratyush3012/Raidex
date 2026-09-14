@@ -151,7 +151,9 @@ export async function api<T = any>(
       detail = j.detail || detail;
     } catch {}
     captureError(new Error(detail), { path, method, status: res.status });
-    throw new Error(detail);
+    const err = new Error(detail) as Error & { status?: number };
+    err.status = res.status;
+    throw err;
   }
   if (res.status === 204) return {} as T;
   const json = (await res.json()) as T;

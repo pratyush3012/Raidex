@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "Raidex",
-    "slug": "raidexrentals",
+    "slug": "raidex",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -81,7 +81,7 @@
         "origin": false
       },
       "eas": {
-        "projectId": "ab99c9f2-016f-41c2-8702-c8cd8efee778"
+        "projectId": "b50b1b2c-8ff5-428d-86aa-b93961985189"
       }
     }
   }

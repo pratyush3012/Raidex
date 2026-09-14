@@ -28,14 +28,18 @@ const AGENT_META: Record<AgentKind, { title: string; sub: string; icon: any; pat
 type Msg = { role: "user" | "assistant"; content: string };
 
 export default function SupportChat() {
-  const { agent: agentParam } = useLocalSearchParams<{ agent?: AgentKind }>();
+  const { agent: agentParam, booking_id } = useLocalSearchParams<{ agent?: AgentKind; booking_id?: string }>();
   const agent: AgentKind = (agentParam as AgentKind) || "support";
   const meta = AGENT_META[agent];
   const c = useTheme();
   const router = useRouter();
   const [thread, setThread] = useState<string | null>(null);
   const [msgs, setMsgs] = useState<Msg[]>([]);
-  const [input, setInput] = useState("");
+  // When opened with a booking in context (e.g. from the active-trip screen),
+  // pre-fill the first message so the rider doesn't have to re-explain which
+  // booking they're asking about — this is just a text prefill, not real
+  // booking-aware context on the agent's side.
+  const [input, setInput] = useState(booking_id ? `About booking ${booking_id}: ` : "");
   const [busy, setBusy] = useState(false);
   const scrollRef = useRef<ScrollView>(null);
 

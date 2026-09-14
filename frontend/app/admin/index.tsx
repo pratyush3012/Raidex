@@ -1,13 +1,15 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, Alert, Switch } from "react-native";
 import { Image } from "expo-image";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
+import { isBefore, isSameDay } from "date-fns";
 import { useTheme, tokens } from "@/src/theme";
 import { api } from "@/src/api/client";
 import { approveKyc, rejectKyc, updateDispute, approveVehicleSwap, rejectVehicleSwap } from "@/src/features/admin/api/admin";
 import { useAuth } from "@/src/context/AuthContext";
+import { MIN_BOOKING_LEAD_HOURS, QuickDatePicker, TimeSlotPicker, mergeDateAndTime } from "@/src/components/ScheduleCalendar";
 import {
   RaidexButton,
   RaidexCard,
@@ -20,11 +22,97 @@ import {
   RaidexMetricCard,
 } from "@/src/components/ui";
 
-type Tab = "kpis" | "vehicles" | "kyc" | "users" | "payments" | "disputes" | "swaps" | "geofence" | "health" | "nexus" | "payouts" | "flags";
+type Tab = "kpis" | "vehicles" | "kyc" | "users" | "payments" | "disputes" | "swaps" | "geofence" | "health" | "nexus" | "payouts" | "pricing" | "flags";
 
 // Tabs whose body is a fetched list - these get row skeletons while loading
 // instead of the generic top-of-scroll spinner used for the rest.
-const LIST_TABS: Tab[] = ["vehicles", "kyc", "users", "payments", "disputes", "swaps", "geofence", "payouts"];
+const LIST_TABS: Tab[] = ["vehicles", "kyc", "users", "payments", "disputes", "swaps", "geofence", "payouts", "pricing"];
+
+// Metadata-driven layout for the global pricing rules form (PricingConfigUpdate
+// in backend/server.py / DEFAULT_CONFIG in raidex_platform/pricing_engine.py).
+// `pct` fields are stored server-side as 0..1 fractions but edited here as a
+// 0..100 percentage, matching the existing commission-rate input convention
+// (see commissionInput above).
+type PricingFieldDef = { key: string; label: string; path: string[]; pct?: boolean; suffix?: string };
+
+const PRICING_FIELD_GROUPS: { title: string; fields: PricingFieldDef[] }[] = [
+  {
+    title: "Duration & Notice",
+    fields: [
+      { key: "min_booking_hours_car", label: "Min booking hours - Car", path: ["min_booking_hours", "car"] },
+      { key: "min_booking_hours_bike", label: "Min booking hours - Bike", path: ["min_booking_hours", "bike"] },
+      { key: "min_notice_hours", label: "Min notice hours", path: ["min_notice_hours"] },
+    ],
+  },
+  {
+    title: "Duration & Lead-Time Curve",
+    fields: [
+      { key: "duration_threshold", label: "Long-duration threshold (hours)", path: ["duration_curve", "long_duration_threshold_hours"] },
+      { key: "lead_time_threshold", label: "Max discount lead time (hours)", path: ["lead_time_curve", "max_discount_lead_hours"] },
+      { key: "weight_duration", label: "Duration weight", path: ["factor_weights", "duration"], pct: true, suffix: "%" },
+      { key: "weight_lead_time", label: "Lead-time weight", path: ["factor_weights", "lead_time"], pct: true, suffix: "%" },
+    ],
+  },
+  {
+    title: "Fees, Tax & Price Lock",
+    fields: [
+      { key: "platform_fee_pct", label: "Platform fee", path: ["platform_fee_pct"], pct: true, suffix: "%" },
+      { key: "tax_rate", label: "Tax rate", path: ["tax", "rate"], pct: true, suffix: "%" },
+      { key: "price_lock_minutes", label: "Price lock (minutes)", path: ["price_lock_minutes"] },
+    ],
+  },
+  {
+    title: "Late & Early Check-in",
+    fields: [
+      { key: "early_checkin_grace_minutes", label: "Early check-in grace (minutes)", path: ["early_checkin_grace_minutes"] },
+      { key: "late_fee_multiplier", label: "Late fee multiplier", path: ["late_fee_multiplier"] },
+      { key: "late_fee_split_host", label: "Late fee split - Host", path: ["late_fee_split", "host"], pct: true, suffix: "%" },
+      { key: "late_fee_split_platform", label: "Late fee split - Platform", path: ["late_fee_split", "platform"], pct: true, suffix: "%" },
+      { key: "early_checkin_split_host", label: "Early check-in split - Host", path: ["early_checkin_split", "host"], pct: true, suffix: "%" },
+      { key: "early_checkin_split_platform", label: "Early check-in split - Platform", path: ["early_checkin_split", "platform"], pct: true, suffix: "%" },
+    ],
+  },
+  {
+    title: "Host Payout",
+    fields: [
+      { key: "host_payout_pct", label: "Host payout", path: ["host_payout_pct"], pct: true, suffix: "%" },
+    ],
+  },
+  {
+    title: "Add-on Pricing (₹)",
+    fields: [
+      { key: "addon_helmet", label: "Helmet", path: ["add_ons_pricing", "helmet"] },
+      { key: "addon_insurance", label: "Insurance", path: ["add_ons_pricing", "insurance"] },
+      { key: "addon_delivery", label: "Delivery", path: ["add_ons_pricing", "delivery"] },
+    ],
+  },
+];
+
+function getAtPath(obj: any, path: string[]): any {
+  return path.reduce((o, k) => (o == null ? undefined : o[k]), obj);
+}
+
+function setAtPath(obj: any, path: string[], value: any) {
+  let cur = obj;
+  for (let i = 0; i < path.length - 1; i++) {
+    const k = path[i];
+    if (!cur[k] || typeof cur[k] !== "object") cur[k] = {};
+    cur = cur[k];
+  }
+  cur[path[path.length - 1]] = value;
+}
+
+function formatFieldValue(cfg: any, f: PricingFieldDef): string {
+  const raw = getAtPath(cfg, f.path);
+  if (raw === null || raw === undefined) return "";
+  return f.pct ? String(Math.round(raw * 1000) / 10) : String(raw);
+}
+
+function buildPricingForm(cfg: any): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const group of PRICING_FIELD_GROUPS) for (const f of group.fields) out[f.key] = formatFieldValue(cfg, f);
+  return out;
+}
 
 // Flags this app actually checks somewhere (via GET /features/{flag} or
 // FeatureFlagService) - shown even if no admin has ever saved a row for them
@@ -74,6 +162,26 @@ export default function AdminConsole() {
   const [flagBusy, setFlagBusy] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
+  // --- Pricing tab state ---
+  const [pricingConfig, setPricingConfig] = useState<any>(null);
+  const [pricingVehicles, setPricingVehicles] = useState<any[]>([]);
+  const [editingPricing, setEditingPricing] = useState(false);
+  const [pricingForm, setPricingForm] = useState<Record<string, string>>({});
+  const [taxEnabled, setTaxEnabled] = useState(true);
+  const [taxInclusive, setTaxInclusive] = useState(false);
+  const [savingPricing, setSavingPricing] = useState(false);
+  const [vehiclePricingTarget, setVehiclePricingTarget] = useState<any>(null);
+  const [vehicleQuery, setVehicleQuery] = useState("");
+  const [simVehicle, setSimVehicle] = useState<any>(null);
+  const today = useMemo(() => new Date(), []);
+  const [simPickupDate, setSimPickupDate] = useState<Date>(today);
+  const [simPickupTime, setSimPickupTime] = useState<string | null>(null);
+  const [simReturnDate, setSimReturnDate] = useState<Date>(today);
+  const [simReturnTime, setSimReturnTime] = useState<string | null>(null);
+  const [simResult, setSimResult] = useState<any>(null);
+  const [simLoading, setSimLoading] = useState(false);
+  const [simError, setSimError] = useState<string | null>(null);
+
   const loadPayouts = useCallback(async (status: string) => {
     setLoading(true);
     try {
@@ -107,6 +215,14 @@ export default function AdminConsole() {
         const byFlag: Record<string, any> = {};
         for (const row of saved) byFlag[row.flag] = row;
         setFlags(byFlag);
+      }
+      if (t === "pricing") {
+        const [cfg, allVehicles] = await Promise.all([
+          api<any>("/admin/pricing-config"),
+          api<any[]>("/admin/vehicles"),
+        ]);
+        setPricingConfig(cfg);
+        setPricingVehicles(allVehicles);
       }
     } catch (e: any) { Alert.alert("Error", e.message); } finally { setLoading(false); }
   }, [payoutStatusFilter]);
@@ -218,6 +334,7 @@ export default function AdminConsole() {
     { k: "health", label: "Health", ic: "pulse" },
     { k: "nexus", label: "AI Nexus", ic: "sparkles" },
     { k: "payouts", label: "Payouts", ic: "cash" },
+    { k: "pricing", label: "Pricing", ic: "calculator" },
     { k: "flags", label: "Flags", ic: "flag-outline" },
   ];
 
@@ -295,6 +412,138 @@ export default function AdminConsole() {
     );
   };
 
+  const startEditPricing = () => {
+    setPricingForm(buildPricingForm(pricingConfig));
+    setTaxEnabled(!!pricingConfig?.tax?.enabled);
+    setTaxInclusive(!!pricingConfig?.tax?.inclusive);
+    setEditingPricing(true);
+  };
+
+  const weightSum = useMemo(() => {
+    const d = parseFloat(pricingForm.weight_duration);
+    const l = parseFloat(pricingForm.weight_lead_time);
+    if (isNaN(d) || isNaN(l)) return null;
+    return d + l;
+  }, [pricingForm.weight_duration, pricingForm.weight_lead_time]);
+
+  const savePricingConfig = () => {
+    const updates: any = {};
+    for (const group of PRICING_FIELD_GROUPS) {
+      for (const f of group.fields) {
+        const raw = parseFloat(pricingForm[f.key]);
+        if (isNaN(raw)) {
+          Alert.alert("Invalid input", `"${f.label}" must be a number.`);
+          return;
+        }
+        setAtPath(updates, f.path, f.pct ? raw / 100 : raw);
+      }
+    }
+    updates.tax = { ...(updates.tax || {}), enabled: taxEnabled, inclusive: taxInclusive };
+    Alert.alert(
+      "Update pricing rules?",
+      "This changes how every future booking is priced across the platform.",
+      [
+        { text: "Cancel" },
+        {
+          text: "Confirm",
+          onPress: async () => {
+            setSavingPricing(true);
+            try {
+              const updated = await api<any>("/admin/pricing-config", { method: "PUT", body: updates });
+              setPricingConfig(updated);
+              setEditingPricing(false);
+            } catch (e: any) {
+              Alert.alert("Error", e.message);
+            } finally {
+              setSavingPricing(false);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const saveVehiclePricing = async (vehicleId: string, minRate: number, maxRate: number) => {
+    const updated = await api<any>(`/admin/vehicles/${vehicleId}/pricing`, {
+      method: "PATCH",
+      body: { min_hourly_rate: minRate, max_hourly_rate: maxRate },
+    });
+    setPricingVehicles((prev) => prev.map((v) => (v.vehicle_id === vehicleId ? { ...v, ...updated } : v)));
+    setVehicles((prev) => prev.map((v) => (v.vehicle_id === vehicleId ? { ...v, ...updated } : v)));
+    setSimVehicle((prev: any) => (prev && prev.vehicle_id === vehicleId ? { ...prev, ...updated } : prev));
+    setVehiclePricingTarget(null);
+  };
+
+  const filteredPricingVehicles = useMemo(() => {
+    const q = vehicleQuery.trim().toLowerCase();
+    if (!q) return pricingVehicles;
+    return pricingVehicles.filter((v) =>
+      [v.name, v.brand, v.model].filter(Boolean).some((s: string) => s.toLowerCase().includes(q))
+    );
+  }, [pricingVehicles, vehicleQuery]);
+
+  const pickSimVehicle = (v: any) => {
+    setSimVehicle(v);
+    setSimPickupDate(today);
+    setSimPickupTime(null);
+    setSimReturnDate(today);
+    setSimReturnTime(null);
+    setSimResult(null);
+    setSimError(null);
+  };
+
+  // Keep the return date/time coherent as the pickup side changes - mirrors
+  // the consumer booking screen's own reset behavior (app/booking/[id].tsx)
+  // rather than inventing a new rule here.
+  useEffect(() => {
+    if (isBefore(simReturnDate, simPickupDate)) {
+      setSimReturnDate(simPickupDate);
+      setSimReturnTime(null);
+    }
+  }, [simPickupDate]);
+
+  useEffect(() => {
+    if (!simPickupTime || !simReturnTime) return;
+    if (isSameDay(simPickupDate, simReturnDate) && Number(simReturnTime.split(":")[0]) <= Number(simPickupTime.split(":")[0])) {
+      setSimReturnTime(null);
+    }
+  }, [simPickupTime]);
+
+  // Recalculate (debounced) whenever the simulator's vehicle or dates change,
+  // so an admin sees pricing update immediately without a manual "recalculate"
+  // button - matching the pricing-simulate endpoint's stated purpose.
+  useEffect(() => {
+    if (!simVehicle || !simPickupTime || !simReturnTime) {
+      setSimResult(null);
+      setSimError(null);
+      return;
+    }
+    const start = mergeDateAndTime(simPickupDate, simPickupTime);
+    const end = mergeDateAndTime(simReturnDate, simReturnTime);
+    if (end <= start) {
+      setSimResult(null);
+      setSimError("Return must be after pickup.");
+      return;
+    }
+    setSimError(null);
+    const handle = setTimeout(async () => {
+      setSimLoading(true);
+      try {
+        const result = await api<any>("/admin/pricing-simulate", {
+          method: "POST",
+          body: { vehicle_id: simVehicle.vehicle_id, start_date: start.toISOString(), end_date: end.toISOString() },
+        });
+        setSimResult(result);
+      } catch (e: any) {
+        setSimError(e.message);
+        setSimResult(null);
+      } finally {
+        setSimLoading(false);
+      }
+    }, 450);
+    return () => clearTimeout(handle);
+  }, [simVehicle, simPickupDate, simPickupTime, simReturnDate, simReturnTime]);
+
   return (
     <View style={{ flex: 1, backgroundColor: c.surface }}>
       <SafeAreaView edges={["top"]} style={{ backgroundColor: c.surface }}>
@@ -368,6 +617,12 @@ export default function AdminConsole() {
                         onPress={async () => { await api(`/admin/vehicles/${v.vehicle_id}/reject`, { method: "POST", body: { reason: "Did not meet standards" } }); loadTab("vehicles"); }}
                         style={[styles.smBtn, { backgroundColor: c.error }]}>
                         <Text style={{ color: "#fff", fontSize: 12, fontWeight: tokens.weight.bold }}>Reject</Text>
+                      </Pressable>
+                      <Pressable
+                        testID={`set-rates-${v.vehicle_id}`}
+                        onPress={() => setVehiclePricingTarget(v)}
+                        style={[styles.smBtn, { backgroundColor: c.surface3 }]}>
+                        <Text style={{ color: c.onSurface, fontSize: 12, fontWeight: tokens.weight.bold }}>Set rates</Text>
                       </Pressable>
                     </View>
                   </View>
@@ -735,6 +990,240 @@ export default function AdminConsole() {
           </View>
         )}
 
+        {tab === "pricing" && (
+          <View>
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+              <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: 14 }}>Global pricing rules</Text>
+              {pricingConfig && !editingPricing && (
+                <RaidexButton testID="pricing-edit-btn" label="Edit" onPress={startEditPricing} size="md" fullWidth={false} />
+              )}
+            </View>
+
+            {loading && !pricingConfig ? (
+              <RowSkeletons />
+            ) : pricingConfig ? (
+              <RaidexCard padding={tokens.spacing.md} style={{ marginBottom: 16 }}>
+                <Text style={{ color: c.onSurface3, fontSize: 11 }}>
+                  Version {pricingConfig.version}
+                  {pricingConfig.updated_at ? ` · Updated ${new Date(pricingConfig.updated_at).toLocaleString()}` : ""}
+                  {pricingConfig.updated_by ? ` by ${pricingConfig.updated_by}` : ""}
+                </Text>
+
+                {!editingPricing ? (
+                  <View style={{ marginTop: 8 }}>
+                    {PRICING_FIELD_GROUPS.map((group) => (
+                      <View key={group.title} style={{ marginTop: 12 }}>
+                        <Text style={{ color: c.onSurface2, fontSize: 11, fontWeight: tokens.weight.bold, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{group.title}</Text>
+                        {group.fields.map((f) => (
+                          <View key={f.key} style={{ flexDirection: "row", justifyContent: "space-between", paddingVertical: 3 }}>
+                            <Text style={{ color: c.onSurface3, fontSize: 12 }}>{f.label}</Text>
+                            <Text style={{ color: c.onSurface, fontSize: 12, fontWeight: tokens.weight.semibold }}>{formatFieldValue(pricingConfig, f)}{f.suffix || ""}</Text>
+                          </View>
+                        ))}
+                      </View>
+                    ))}
+                    <View style={{ marginTop: 12 }}>
+                      <Text style={{ color: c.onSurface2, fontSize: 11, fontWeight: tokens.weight.bold, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>Tax</Text>
+                      <View style={{ flexDirection: "row", justifyContent: "space-between", paddingVertical: 3 }}>
+                        <Text style={{ color: c.onSurface3, fontSize: 12 }}>Enabled</Text>
+                        <Text style={{ color: c.onSurface, fontSize: 12, fontWeight: tokens.weight.semibold }}>{pricingConfig.tax?.enabled ? "Yes" : "No"}</Text>
+                      </View>
+                      <View style={{ flexDirection: "row", justifyContent: "space-between", paddingVertical: 3 }}>
+                        <Text style={{ color: c.onSurface3, fontSize: 12 }}>Inclusive</Text>
+                        <Text style={{ color: c.onSurface, fontSize: 12, fontWeight: tokens.weight.semibold }}>{pricingConfig.tax?.inclusive ? "Yes" : "No"}</Text>
+                      </View>
+                    </View>
+                  </View>
+                ) : (
+                  <View style={{ marginTop: 8 }}>
+                    {PRICING_FIELD_GROUPS.map((group) => (
+                      <View key={group.title} style={{ marginTop: 14 }}>
+                        <Text style={{ color: c.onSurface2, fontSize: 11, fontWeight: tokens.weight.bold, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{group.title}</Text>
+                        {group.title === "Duration & Lead-Time Curve" && weightSum !== null && Math.abs(weightSum - 100) > 0.5 && (
+                          <Text style={{ color: c.warning, fontSize: 11, marginBottom: 6 }}>
+                            Duration + lead-time weight = {weightSum.toFixed(1)}% (expected 100%). Saving anyway is allowed, but the factors won't average as intended.
+                          </Text>
+                        )}
+                        {group.fields.map((f) => (
+                          <RaidexInput
+                            key={f.key}
+                            testID={`pricing-field-${f.key}`}
+                            label={f.suffix ? `${f.label} (${f.suffix})` : f.label}
+                            value={pricingForm[f.key] ?? ""}
+                            onChangeText={(t) => setPricingForm((prev) => ({ ...prev, [f.key]: t }))}
+                            keyboardType="decimal-pad"
+                          />
+                        ))}
+                      </View>
+                    ))}
+                    <View style={{ marginTop: 14 }}>
+                      <Text style={{ color: c.onSurface2, fontSize: 11, fontWeight: tokens.weight.bold, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>Tax</Text>
+                      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 6 }}>
+                        <Text style={{ color: c.onSurface, fontSize: 13 }}>Tax enabled</Text>
+                        <Switch testID="pricing-tax-enabled" value={taxEnabled} onValueChange={setTaxEnabled} trackColor={{ false: c.surface3, true: c.accent }} />
+                      </View>
+                      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 6 }}>
+                        <Text style={{ color: c.onSurface, fontSize: 13 }}>Tax inclusive (rate already inside rental subtotal)</Text>
+                        <Switch testID="pricing-tax-inclusive" value={taxInclusive} onValueChange={setTaxInclusive} trackColor={{ false: c.surface3, true: c.accent }} />
+                      </View>
+                    </View>
+                    <View style={{ flexDirection: "row", gap: 8, marginTop: 16 }}>
+                      <View style={{ flex: 1 }}>
+                        <RaidexButton testID="pricing-save-btn" label="Save" onPress={savePricingConfig} loading={savingPricing} size="md" />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <RaidexButton testID="pricing-cancel-btn" label="Cancel" onPress={() => setEditingPricing(false)} variant="secondary" size="md" disabled={savingPricing} />
+                      </View>
+                    </View>
+                  </View>
+                )}
+              </RaidexCard>
+            ) : null}
+
+            <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: 14, marginBottom: 8 }}>Vehicles ({filteredPricingVehicles.length})</Text>
+            <RaidexInput
+              testID="pricing-vehicle-search"
+              value={vehicleQuery}
+              onChangeText={setVehicleQuery}
+              placeholder="Search by name, brand or model"
+              icon="search"
+            />
+            {loading && pricingVehicles.length === 0 ? (
+              <RowSkeletons />
+            ) : filteredPricingVehicles.length === 0 ? (
+              <RaidexEmptyState icon="car-outline" title="No vehicles found" />
+            ) : (
+              filteredPricingVehicles.map((v) => (
+                <RaidexCard key={v.vehicle_id} padding={tokens.spacing.md} style={{ flexDirection: "row", gap: 12, marginBottom: 8 }}>
+                  <Image source={v.image} style={{ width: 56, height: 56, borderRadius: 10 }} contentFit="cover" />
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold }}>{v.name}</Text>
+                    <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 2 }}>{v.brand} {v.model} · ₹{v.price_per_hour}/hr</Text>
+                    <Text style={{ color: c.onSurface3, fontSize: 11, marginTop: 2 }}>
+                      {v.min_hourly_rate != null && v.max_hourly_rate != null
+                        ? `Rate range ₹${v.min_hourly_rate} - ₹${v.max_hourly_rate}/hr`
+                        : "Not yet priced - no admin rate range set"}
+                    </Text>
+                    <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
+                      <Pressable
+                        testID={`pricing-set-rates-${v.vehicle_id}`}
+                        onPress={() => setVehiclePricingTarget(v)}
+                        style={[styles.smBtn, { backgroundColor: c.surface3 }]}>
+                        <Text style={{ color: c.onSurface, fontSize: 12, fontWeight: tokens.weight.bold }}>Edit rates</Text>
+                      </Pressable>
+                      <Pressable
+                        testID={`pricing-simulate-pick-${v.vehicle_id}`}
+                        onPress={() => pickSimVehicle(v)}
+                        style={[styles.smBtn, { backgroundColor: simVehicle?.vehicle_id === v.vehicle_id ? c.accent : c.surface3 }]}>
+                        <Text style={{ color: simVehicle?.vehicle_id === v.vehicle_id ? "#fff" : c.onSurface, fontSize: 12, fontWeight: tokens.weight.bold }}>
+                          {simVehicle?.vehicle_id === v.vehicle_id ? "Simulating" : "Simulate"}
+                        </Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                </RaidexCard>
+              ))
+            )}
+
+            <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: 14, marginTop: 8, marginBottom: 12 }}>Price simulator</Text>
+            {!simVehicle ? (
+              <RaidexEmptyState icon="calculator-outline" title="Pick a vehicle above to simulate pricing" />
+            ) : (
+              <View>
+                <RaidexCard padding={tokens.spacing.md} style={{ marginBottom: 12 }}>
+                  <Text style={{ color: c.onSurface, fontWeight: tokens.weight.semibold }}>{simVehicle.name}</Text>
+                  <Text style={{ color: c.onSurface3, fontSize: 12, marginTop: 2 }}>{simVehicle.brand} {simVehicle.model} · Rate range ₹{simVehicle.min_hourly_rate ?? "-"} - ₹{simVehicle.max_hourly_rate ?? "-"}/hr</Text>
+                </RaidexCard>
+
+                <QuickDatePicker c={c} label="Pickup date" selectedDate={simPickupDate} minDate={today} onSelect={setSimPickupDate} testIDPrefix="sim-pickup-date" />
+                <View style={{ marginTop: 12 }}>
+                  <TimeSlotPicker
+                    c={c}
+                    selected={simPickupTime}
+                    testIDPrefix="sim-pickup-time"
+                    emptyLabel={`No slots left today - pick tomorrow (${MIN_BOOKING_LEAD_HOURS}h notice required)`}
+                    isDisabled={(hour) => {
+                      if (!isSameDay(simPickupDate, today)) return false;
+                      const cutoff = new Date(Date.now() + MIN_BOOKING_LEAD_HOURS * 3_600_000);
+                      return mergeDateAndTime(simPickupDate, `${String(hour).padStart(2, "0")}:00`) < cutoff;
+                    }}
+                    onSelect={setSimPickupTime}
+                  />
+                </View>
+
+                <View style={{ marginTop: 16 }}>
+                  <QuickDatePicker c={c} label="Return date" selectedDate={simReturnDate} minDate={simPickupDate} onSelect={(d) => { setSimReturnDate(d); setSimReturnTime(null); }} testIDPrefix="sim-return-date" />
+                  <View style={{ marginTop: 12 }}>
+                    <TimeSlotPicker
+                      c={c}
+                      selected={simReturnTime}
+                      testIDPrefix="sim-return-time"
+                      emptyLabel={!simPickupTime ? "Pick a pickup time first" : "No slots available"}
+                      isDisabled={(hour) => {
+                        if (!simPickupTime) return true;
+                        if (!isSameDay(simPickupDate, simReturnDate)) return false;
+                        return hour <= Number(simPickupTime.split(":")[0]);
+                      }}
+                      onSelect={setSimReturnTime}
+                    />
+                  </View>
+                </View>
+
+                <View style={{ marginTop: 16 }}>
+                  {simLoading && <ActivityIndicator color={c.accent} style={{ marginVertical: 12 }} />}
+                  {simError && <Text style={{ color: c.error, fontSize: 12, marginBottom: 8 }}>{simError}</Text>}
+                  {simResult && !simLoading && (
+                    <View>
+                      <RaidexCard variant="dark" padding={tokens.spacing.lg} style={{ borderRadius: 20, marginBottom: 12 }}>
+                        <Text style={{ color: "#05C46B", fontSize: 11, fontWeight: tokens.weight.bold, letterSpacing: 3 }}>TOTAL PAYABLE</Text>
+                        <Text testID="sim-total-payable" style={{ color: "#fff", fontSize: 32, fontWeight: tokens.weight.bold, marginTop: 6 }}>{simResult.currency} {Number(simResult.total_payable).toLocaleString()}</Text>
+                        <Text style={{ color: "rgba(255,255,255,0.7)", marginTop: 4 }}>
+                          {simResult.calculated_hourly_rate}/hr · {simResult.duration_hours}h · {simResult.lead_time_hours}h notice
+                        </Text>
+                      </RaidexCard>
+
+                      {(!simResult.meets_minimum_duration || !simResult.meets_minimum_notice) && (
+                        <RaidexCard padding={tokens.spacing.md} style={{ marginBottom: 12, borderColor: c.warning, borderWidth: 1 }}>
+                          {!simResult.meets_minimum_duration && (
+                            <Text style={{ color: c.warning, fontSize: 12 }}>Below minimum bookable duration ({simResult.min_booking_hours}h)</Text>
+                          )}
+                          {!simResult.meets_minimum_notice && (
+                            <Text style={{ color: c.warning, fontSize: 12 }}>Below minimum notice ({simResult.min_notice_hours}h)</Text>
+                          )}
+                        </RaidexCard>
+                      )}
+
+                      <RaidexCard padding={tokens.spacing.md}>
+                        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 14 }}>
+                          {[
+                            ["RATE RANGE", `₹${simResult.rate_range.min} - ₹${simResult.rate_range.max}/hr`],
+                            ["DURATION FACTOR", simResult.duration_factor],
+                            ["LEAD-TIME FACTOR", simResult.lead_time_factor],
+                            ["COMBINED FACTOR", simResult.combined_factor],
+                            ["RENTAL SUBTOTAL", `₹${Number(simResult.rental_subtotal).toLocaleString()}`],
+                            ["PLATFORM FEE", `₹${Number(simResult.platform_fee).toLocaleString()} (${(simResult.platform_fee_pct * 100).toFixed(0)}%)`],
+                            ["TAX", `₹${Number(simResult.tax).toLocaleString()} (${(simResult.tax_rate * 100).toFixed(0)}%)`],
+                            ["DISCOUNT", `₹${Number(simResult.discount).toLocaleString()}`],
+                            ["SECURITY DEPOSIT", `₹${Number(simResult.security_deposit).toLocaleString()}`],
+                            ["HOST PAYOUT", `₹${Number(simResult.host_payout).toLocaleString()} (${(simResult.host_payout_pct * 100).toFixed(0)}%)`],
+                            ["PLATFORM COMMISSION", `₹${Number(simResult.platform_commission).toLocaleString()}`],
+                            ["PRICING RULE VERSION", simResult.pricing_rule_version],
+                          ].map(([label, value]) => (
+                            <View key={label as string} style={{ minWidth: "45%" }}>
+                              <Text style={{ color: c.onSurface3, fontSize: 10, fontWeight: tokens.weight.semibold }}>{label}</Text>
+                              <Text style={{ color: c.onSurface, fontWeight: tokens.weight.semibold, marginTop: 2 }}>{String(value)}</Text>
+                            </View>
+                          ))}
+                        </View>
+                      </RaidexCard>
+                    </View>
+                  )}
+                </View>
+              </View>
+            )}
+          </View>
+        )}
+
         {tab === "flags" && (
           <View>
             <Text style={{ color: c.onSurface, fontWeight: tokens.weight.bold, fontSize: 14, marginBottom: 4 }}>Feature flags</Text>
@@ -802,6 +1291,14 @@ export default function AdminConsole() {
           swap={swapRejectTarget}
           onDismiss={() => setSwapRejectTarget(null)}
           onConfirm={(notes: string) => rejectSwap(swapRejectTarget.swap_id, notes)}
+        />
+      )}
+
+      {vehiclePricingTarget && (
+        <VehiclePricingModal
+          vehicle={vehiclePricingTarget}
+          onDismiss={() => setVehiclePricingTarget(null)}
+          onConfirm={(minRate: number, maxRate: number) => saveVehiclePricing(vehiclePricingTarget.vehicle_id, minRate, maxRate)}
         />
       )}
     </View>
@@ -975,6 +1472,63 @@ function SwapRejectModal({ swap, onDismiss, onConfirm }: any) {
         value={notes}
         onChangeText={setNotes}
         placeholder="Notes (optional)"
+      />
+    </RaidexModal>
+  );
+}
+
+function VehiclePricingModal({ vehicle, onDismiss, onConfirm }: any) {
+  const [minRate, setMinRate] = useState(vehicle.min_hourly_rate != null ? String(vehicle.min_hourly_rate) : "");
+  const [maxRate, setMaxRate] = useState(vehicle.max_hourly_rate != null ? String(vehicle.max_hourly_rate) : "");
+  const [busy, setBusy] = useState(false);
+  const submit = async () => {
+    const min = parseFloat(minRate);
+    const max = parseFloat(maxRate);
+    if (isNaN(min) || isNaN(max) || min <= 0 || max <= 0) {
+      Alert.alert("Invalid rate", "Enter valid min/max hourly rates greater than 0.");
+      return;
+    }
+    if (min > max) {
+      Alert.alert("Invalid range", "Min hourly rate cannot exceed max hourly rate.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await onConfirm(min, max);
+    } catch (e: any) {
+      Alert.alert("Error", e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <RaidexModal
+      visible
+      testID="vehicle-pricing-modal"
+      title="Set hourly rate range"
+      subtitle={`${vehicle.name} · ${vehicle.brand} ${vehicle.model}`}
+      onDismiss={onDismiss}
+      primaryLabel="Save"
+      onPrimary={submit}
+      primaryBusy={busy}
+      dismissTestID="vehicle-pricing-dismiss-btn"
+      primaryTestID="vehicle-pricing-confirm-btn"
+    >
+      <RaidexInput
+        testID="vehicle-pricing-min-input"
+        label="Min hourly rate (₹)"
+        value={minRate}
+        onChangeText={setMinRate}
+        keyboardType="decimal-pad"
+        placeholder="e.g. 150"
+      />
+      <RaidexInput
+        testID="vehicle-pricing-max-input"
+        label="Max hourly rate (₹)"
+        value={maxRate}
+        onChangeText={setMaxRate}
+        keyboardType="decimal-pad"
+        placeholder="e.g. 220"
       />
     </RaidexModal>
   );
